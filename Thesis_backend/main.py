@@ -1,3 +1,4 @@
+
 import cv2
 import time
 import io
@@ -19,8 +20,7 @@ app = Flask(__name__)
 model = YOLO("best.pt")
 print(f"This model can detect: {model.names}")
 
-# Updated to use mDNS hostname instead of hardcoded IP
-ESP32_CAM_URL = os.environ.get("http://192.168.1.119:81/stream", "http://esp32-cam.local:81/stream")
+ESP32_CAM_URL = "http://192.168.1.119:81/stream"
 
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get(
@@ -72,7 +72,8 @@ def get_class_color(class_name: str):
 def is_exclusive_lettuce(frame, box, conf) -> bool:
     """
     Lettuce-Exclusive Validation Filter:
-    1. Enforces a relaxed confidence floor (0.40) to allow valid detections.
+1. Enforces a relaxed confidence floor (0.40) to allow valid detections.
+
     2. Uses a broader HSV color space mask to verify plant foliage and
        accommodate dark greens, yellow-greens, and disease lesions.
     """
@@ -907,6 +908,16 @@ def force_save_session():
     ok = save_session_to_supabase()
     return jsonify({"saved": ok})
 
+
+# ======================================================================
+# Main
+# ======================================================================
+if __name__ == '__main__':
+    threading.Thread(target=reader_thread, daemon=True).start()
+    threading.Thread(target=inference_thread, daemon=True).start()
+    # threading.Thread(target=session_flush_thread, daemon=True).start()
+    print("[Main] Threads started. Serving on http://0.0.0.0:5000")
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
 
 if __name__ == '__main__':
     print("[Main] Serving locally on http://0.0.0.0:5000")
