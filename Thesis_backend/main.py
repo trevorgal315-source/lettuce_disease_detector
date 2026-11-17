@@ -20,7 +20,7 @@ model = YOLO("best.pt")
 print(f"This model can detect: {model.names}")
 
 # Updated to use mDNS hostname instead of hardcoded IP
-ESP32_CAM_URL = os.environ.get("ESP32_CAM_URL", "http://esp32-cam.local:81/stream")
+ESP32_CAM_URL = os.environ.get("http://192.168.1.119:81/stream", "http://esp32-cam.local:81/stream")
 
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get(
