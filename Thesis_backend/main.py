@@ -19,9 +19,8 @@ app = Flask(__name__)
 model = YOLO("best.pt")
 print(f"This model can detect: {model.names}")
 
-
-# Automatically picks up the Railway environment variable, falls back to local if testing locally
-ESP32_CAM_URL = os.environ.get("ESP32_CAM_URL", "http://esp32-cam.local:81/stream")
+# Updated to use mDNS hostname instead of hardcoded IP
+ESP32_CAM_URL = "http://esp32-cam.local:81/stream"
 
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get(
@@ -73,8 +72,9 @@ def get_class_color(class_name: str):
 def is_exclusive_lettuce(frame, box, conf) -> bool:
     """
     Lettuce-Exclusive Validation Filter:
-    1. Enforces confidence floor (0.40) to allow valid detections.
-    2. Uses a broader HSV color space mask to verify plant foliage.
+    1. Enforces a relaxed confidence floor (0.40) to allow valid detections.
+    2. Uses a broader HSV color space mask to verify plant foliage and
+       accommodate dark greens, yellow-greens, and disease lesions.
     """
     if conf < 0.40:
         return False
@@ -333,13 +333,8 @@ def save_session_to_supabase():
                     file_options={"content-type": "image/jpeg"}
                 )
 
-                # Fixed: Safely parse public URL whether string or dict object returned by client
                 public_url_res = supabase.storage.from_("session_snapshots").get_public_url(file_name)
-                if isinstance(public_url_res, dict):
-                    image_url = public_url_res.get("publicUrl") or public_url_res.get("public_url")
-                else:
-                    image_url = str(public_url_res)
-
+                image_url = public_url_res
                 print(f"[Supabase] Snapshot with bounding boxes uploaded: {image_url}")
         except Exception as e:
             print(f"[Supabase] Image upload failed: {e}")
@@ -390,6 +385,22 @@ def on_client_disconnected(last_client: bool):
         next_track_id = 1
     session_start_time = None
     print("[Session] Tracker reset. Ready for next session.")
+
+
+def session_flush_thread():
+    global session_start_time, next_track_id
+    while True:
+        time.sleep(SESSION_FLUSH_INTERVAL)
+        with session_lock:
+            if not session_active:
+                continue
+            saved = save_session_to_supabase()
+            if saved:
+                with tracks_lock:
+                    tracks.clear()
+                    next_track_id = 1
+                session_start_time = time.time()
+                print("[Session] Flush complete. Window restarted.")
 
 
 # ======================================================================
@@ -518,6 +529,7 @@ def inference_thread():
 
                 conf = float(det.conf[0]) if det.conf is not None else 0.0
 
+                # --- EXCLUSIVE AUTOMATED LETTUCE CHECK ---
                 if not is_exclusive_lettuce(frame, box, conf):
                     continue
 
@@ -566,7 +578,7 @@ def draw_tracks_and_summary(frame):
         cv2.putText(frame, label, (x1, max(20, y1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-    # 2. Compute counts for summary banner
+    # 2. Compute counts for the summary banner
     counts = {}
     for tr in snapshot:
         if not tr.confirmed():
@@ -583,8 +595,8 @@ def draw_tracks_and_summary(frame):
     bacterial = counts.get("bacterial leaf spot", 0)
     diseased_total = powdery + downy + bacterial
 
-    # 3. Draw summary bar
-    summary_text = f"total diseases : {diseased_total}"
+    # 3. Draw summary bar with total diseases only, positioned at Y=80
+    summary_text = f"total diseses : {diseased_total}"
 
     cv2.putText(frame, summary_text, (12, 82),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)  # Black outline
@@ -647,7 +659,7 @@ def generate_frames():
 
 
 # ======================================================================
-# Scheduled-scan analysis
+# Scheduled-scan analysis (For Notifications / Periodic Scans)
 # ======================================================================
 def analyze_image(frame):
     with model_lock:
@@ -674,6 +686,7 @@ def analyze_image(frame):
 
         conf = float(det.conf[0]) if det.conf is not None else 0.0
 
+        # --- EXCLUSIVE AUTOMATED LETTUCE CHECK ---
         if not is_exclusive_lettuce(frame, box, conf):
             continue
 
@@ -894,14 +907,6 @@ def force_save_session():
     ok = save_session_to_supabase()
     return jsonify({"saved": ok})
 
-
-# ======================================================================
-# Main
-# ======================================================================
-# Start background threads when the app module loads (works with both Gunicorn & python main.py)
-threading.Thread(target=reader_thread, daemon=True).start()
-threading.Thread(target=inference_thread, daemon=True).start()
-print("[Main] Background reader and inference threads started.")
 
 if __name__ == '__main__':
     print("[Main] Serving locally on http://0.0.0.0:5000")
