@@ -1,38 +1,27 @@
-
-# Copy and install Python dependencies cleanly without caching
-COPY requirements.txt .
-RUN pip install --no-cache-dir --force-reinstall -r requirements.txt
-
-# Use an official lightweight Python runtime
 FROM python:3.11-slim
 
-# Prevent Python from writing .pyc files and enable unbuffered logging
+# Prevent Python from writing pyc files and buffer output
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies required by OpenCV (fixes libxcb.so.1 error) and YOLO
+# Install basic system libraries required for OpenCV headless
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libxcb1 \
     libgl1 \
     libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Set the working directory inside the container
+# Set the working directory
 WORKDIR /app
 
-# Copy and install Python dependencies first (improves Docker build caching)
+# Copy requirements and force a clean reinstall skipping cache to prevent cv2 conflicts
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --force-reinstall -r requirements.txt
 
-# Copy the rest of your application code and your YOLO weights (best.pt)
+# Copy the rest of your application code
 COPY . .
 
-# Expose the port Gunicorn will run on
+# Expose the port (Railway uses $PORT dynamically)
 EXPOSE 8080
 
-# Start Gunicorn with 1 worker and multiple threads so your background threads 
-# (reader_thread & inference_thread) share memory properly without duplicating YOLO
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "8", "--timeout", "120", "main:app"]
+# Start Gunicorn using Railway's dynamic PORT variable
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 8 --timeout 120 main:app"]
