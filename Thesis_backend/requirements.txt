@@ -1,0 +1,7 @@
+Flask
+ultralytics
+opencv-python-headless
+supabase
+numpy
+requests
+gunicorn
