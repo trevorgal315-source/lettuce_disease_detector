@@ -1,7 +1,7 @@
-Flask
+flask
+gunicorn
 ultralytics
 opencv-python-headless
-supabase
 numpy
 requests
-gunicorn
+supabase
