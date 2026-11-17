@@ -1,21 +1,33 @@
-FROM python:3.13-slim
+# Use an official lightweight Python runtime
+FROM python:3.11-slim
 
-# Install system dependencies required by OpenCV and other native packages
+# Prevent Python from writing .pyc files and enable unbuffered logging
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Install system dependencies required by OpenCV (fixes libxcb.so.1 error) and YOLO
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb1 \
     libgl1 \
     libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
+# Set the working directory inside the container
 WORKDIR /app
 
-# Install Python dependencies
+# Copy and install Python dependencies first (improves Docker build caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy the rest of your application code and your YOLO weights (best.pt)
 COPY . .
 
-# Expose port and run Gunicorn
-EXPOSE 5000
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "backend:app"]
+# Expose the port Gunicorn will run on
+EXPOSE 8080
+
+# Start Gunicorn with 1 worker and multiple threads so your background threads 
+# (reader_thread & inference_thread) share memory properly without duplicating YOLO
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "8", "--timeout", "120", "main:app"]
