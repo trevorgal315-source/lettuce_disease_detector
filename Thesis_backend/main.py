@@ -19,8 +19,9 @@ app = Flask(__name__)
 model = YOLO("best.pt")
 print(f"This model can detect: {model.names}")
 
-# Updated to use mDNS hostname instead of hardcoded IP
-ESP32_CAM_URL = "http://esp32-cam.local:81/stream"
+
+# Automatically picks up the Railway environment variable, falls back to local if testing locally
+ESP32_CAM_URL = os.environ.get("ESP32_CAM_URL", "http://esp32-cam.local:81/stream")
 
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get(
