@@ -897,8 +897,11 @@ def force_save_session():
 # ======================================================================
 # Main
 # ======================================================================
+# Start background threads when the app module loads (works with both Gunicorn & python main.py)
+threading.Thread(target=reader_thread, daemon=True).start()
+threading.Thread(target=inference_thread, daemon=True).start()
+print("[Main] Background reader and inference threads started.")
+
 if __name__ == '__main__':
-    threading.Thread(target=reader_thread, daemon=True).start()
-    threading.Thread(target=inference_thread, daemon=True).start()
-    print("[Main] Threads started. Serving on http://0.0.0.0:5000")
+    print("[Main] Serving locally on http://0.0.0.0:5000")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
