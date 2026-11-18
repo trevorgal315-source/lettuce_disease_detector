@@ -20,7 +20,7 @@ app = Flask(__name__)
 model = YOLO("best.pt")
 print(f"This model can detect: {model.names}")
 
-ESP32_CAM_URL = "http://192.168.1.119:81/stream"
+ESP32_CAM_URL = "https://anything-garnet-float.ngrok-free.dev "
 
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get(
