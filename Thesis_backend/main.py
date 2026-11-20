@@ -1,12 +1,9 @@
-
 import cv2
 import time
-import io
 import threading
 import os
 import json
 import numpy as np
-import requests
 from collections import deque
 from datetime import datetime
 from flask import Flask, Response, render_template_string, jsonify, request
@@ -20,13 +17,18 @@ app = Flask(__name__)
 model = YOLO("best.pt")
 print(f"This model can detect: {model.names}")
 
-ESP32_CAM_URL = "https://anything-garnet-float.ngrok-free.dev "
+# Optional shared secret so random internet traffic cannot spoof ESP32 frames.
+# Set CAM_PUSH_TOKEN in both ESP32 code and Railway env vars if desired.
+CAM_PUSH_TOKEN = os.environ.get("CAM_PUSH_TOKEN", "")
+CAM_ONLINE_TIMEOUT = 8.0  # seconds without a pushed frame before marking camera offline
 
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get(
     "SUPABASE_URL", "https://isslbortjspiazoslkdu.supabase.co"
 )
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_secret_omRLJyMKoDkAhPKeTmsAtg_Yb05T48f")
+SUPABASE_KEY = os.environ.get(
+    "SUPABASE_KEY", "sb_secret_omRLJyMKoDkAhPKeTmsAtg_Yb05T48f"
+)
 if not SUPABASE_KEY:
     print("[Supabase] WARNING: SUPABASE_KEY not set - detections will NOT be saved.")
 
@@ -46,7 +48,6 @@ INFER_INTERVAL = 0.15
 INFER_IMGSZ = 640
 JPEG_QUALITY = 80
 MEMORY_TIME = 15.0
-CHUNK_SIZE = 8192
 IOU_MATCH_THRESHOLD = 0.15
 MIN_FRAMES_TO_CONFIRM = 1
 
@@ -72,8 +73,7 @@ def get_class_color(class_name: str):
 def is_exclusive_lettuce(frame, box, conf) -> bool:
     """
     Lettuce-Exclusive Validation Filter:
-1. Enforces a relaxed confidence floor (0.40) to allow valid detections.
-
+    1. Enforces a relaxed confidence floor (0.40) to allow valid detections.
     2. Uses a broader HSV color space mask to verify plant foliage and
        accommodate dark greens, yellow-greens, and disease lesions.
     """
@@ -98,10 +98,8 @@ def is_exclusive_lettuce(frame, box, conf) -> bool:
         if crop.size == 0:
             return False
 
-        # Convert crop to HSV to evaluate foliage pigment
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
 
-        # Expanded HSV range to include dark greens, yellows, and spots
         lower_foliage = np.array([5, 10, 10])
         upper_foliage = np.array([105, 255, 255])
 
@@ -111,13 +109,12 @@ def is_exclusive_lettuce(frame, box, conf) -> bool:
 
         foliage_ratio = foliage_pixel_count / float(total_pixels)
 
-        # Requires at least 3% of the bounding box to match authentic plant tissue
         if foliage_ratio < 0.03:
             return False
 
         return True
     except Exception:
-        return True  # Fallback if coordinate math encounters an edge case
+        return True
 
 
 def health_label_for(diseased: int) -> str:
@@ -136,6 +133,8 @@ def health_label_for(diseased: int) -> str:
 latest_frame = None
 frame_lock = threading.Lock()
 frame_id = 0
+last_frame_push_time = 0.0
+pushed_frames_count = 0
 
 model_lock = threading.Lock()
 
@@ -162,6 +161,13 @@ def _save_notif_counter():
             json.dump({"counter": notif_counter}, f)
     except Exception:
         pass
+
+
+def is_camera_online() -> bool:
+    with frame_lock:
+        if latest_frame is None or last_frame_push_time == 0.0:
+            return False
+        return (time.time() - last_frame_push_time) <= CAM_ONLINE_TIMEOUT
 
 
 # ======================================================================
@@ -201,12 +207,16 @@ class Track:
         return sum(v["count"] for v in self.cls_votes.values())
 
     def best_class(self):
-        return max(self.cls_votes.items(),
-                   key=lambda kv: (kv[1]["count"], kv[1]["conf_sum"]))[0]
+        return max(
+            self.cls_votes.items(),
+            key=lambda kv: (kv[1]["count"], kv[1]["conf_sum"]),
+        )[0]
 
     def best_confidence(self):
-        _, stats = max(self.cls_votes.items(),
-                       key=lambda kv: (kv[1]["count"], kv[1]["conf_sum"]))
+        _, stats = max(
+            self.cls_votes.items(),
+            key=lambda kv: (kv[1]["count"], kv[1]["conf_sum"]),
+        )
         return stats["conf_sum"] / stats["count"]
 
     def confirmed(self):
@@ -247,8 +257,9 @@ def tracker_update(detections, now):
                 tracks[best_idx].update(det["cls_id"], det["conf"], det["box"], now)
                 used[best_idx] = True
             else:
-                tracks.append(Track(next_track_id, det["cls_id"],
-                                    det["conf"], det["box"], now))
+                tracks.append(
+                    Track(next_track_id, det["cls_id"], det["conf"], det["box"], now)
+                )
                 used.append(True)
                 next_track_id += 1
 
@@ -323,7 +334,9 @@ def save_session_to_supabase():
         try:
             draw_tracks_and_summary(snapshot_frame)
 
-            success, encoded_img = cv2.imencode('.jpg', snapshot_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            success, encoded_img = cv2.imencode(
+                ".jpg", snapshot_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+            )
             if success:
                 file_bytes = encoded_img.tobytes()
                 file_name = f"session_{int(time.time())}.jpg"
@@ -331,10 +344,12 @@ def save_session_to_supabase():
                 supabase.storage.from_("session_snapshots").upload(
                     path=file_name,
                     file=file_bytes,
-                    file_options={"content-type": "image/jpeg"}
+                    file_options={"content-type": "image/jpeg"},
                 )
 
-                public_url_res = supabase.storage.from_("session_snapshots").get_public_url(file_name)
+                public_url_res = supabase.storage.from_(
+                    "session_snapshots"
+                ).get_public_url(file_name)
                 image_url = public_url_res
                 print(f"[Supabase] Snapshot with bounding boxes uploaded: {image_url}")
         except Exception as e:
@@ -405,74 +420,19 @@ def session_flush_thread():
 
 
 # ======================================================================
-# Reader thread
-# ======================================================================
-def reader_thread():
-    global latest_frame, frame_id
-    session = requests.Session()
-    backoff = 1
-
-    while True:
-        try:
-            print(f"[Reader] Connecting to {ESP32_CAM_URL}")
-            resp = session.get(
-                ESP32_CAM_URL,
-                stream=True,
-                timeout=(3, 5),
-                headers={"Cache-Control": "no-cache"},
-            )
-            resp.raise_for_status()
-            print("[Reader] Connected.")
-            backoff = 1
-            buf = bytearray()
-
-            for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
-                if not chunk:
-                    continue
-                buf.extend(chunk)
-
-                last_jpg = None
-                while True:
-                    a = buf.find(b"\xff\xd8")
-                    if a == -1:
-                        buf.clear()
-                        break
-                    b = buf.find(b"\xff\xd9", a + 2)
-                    if b == -1:
-                        if a > 0:
-                            del buf[:a]
-                        break
-                    last_jpg = bytes(buf[a: b + 2])
-                    del buf[: b + 2]
-
-                if len(buf) > 4_000_000:
-                    buf.clear()
-
-                if last_jpg is not None:
-                    frame = cv2.imdecode(
-                        np.frombuffer(last_jpg, np.uint8), cv2.IMREAD_COLOR
-                    )
-                    if frame is not None:
-                        with frame_lock:
-                            latest_frame = frame
-                            frame_id += 1
-
-        except Exception as e:
-            print(f"[Reader] Connection dropped: {e}. Reconnecting in {backoff}s...")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 10)
-
-
-# ======================================================================
 # Inference thread
 # ======================================================================
 def extract_box(det):
     try:
-        if hasattr(det, 'xyxyxyxy') and det.xyxyxyxy is not None:
+        if hasattr(det, "xyxyxyxy") and det.xyxyxyxy is not None:
             pts = det.xyxyxyxy[0].cpu().numpy()
-            return (int(np.min(pts[:, 0])), int(np.min(pts[:, 1])),
-                    int(np.max(pts[:, 0])), int(np.max(pts[:, 1])))
-        if hasattr(det, 'xyxy') and det.xyxy is not None:
+            return (
+                int(np.min(pts[:, 0])),
+                int(np.min(pts[:, 1])),
+                int(np.max(pts[:, 0])),
+                int(np.max(pts[:, 1])),
+            )
+        if hasattr(det, "xyxy") and det.xyxy is not None:
             x1, y1, x2, y2 = map(int, det.xyxy[0])
             return (x1, y1, x2, y2)
     except Exception:
@@ -505,8 +465,9 @@ def inference_thread():
 
         try:
             with model_lock:
-                results = model.predict(source=frame, conf=0.40,
-                                        imgsz=INFER_IMGSZ, verbose=False)
+                results = model.predict(
+                    source=frame, conf=0.40, imgsz=INFER_IMGSZ, verbose=False
+                )
             r0 = results[0]
 
             if r0.boxes is not None and len(r0.boxes) > 0:
@@ -530,7 +491,6 @@ def inference_thread():
 
                 conf = float(det.conf[0]) if det.conf is not None else 0.0
 
-                # --- EXCLUSIVE AUTOMATED LETTUCE CHECK ---
                 if not is_exclusive_lettuce(frame, box, conf):
                     continue
 
@@ -576,8 +536,15 @@ def draw_tracks_and_summary(frame):
         else:
             label = f"#{tr.track_id} {display_name} "
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-        cv2.putText(frame, label, (x1, max(20, y1 - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        cv2.putText(
+            frame,
+            label,
+            (x1, max(20, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            color,
+            2,
+        )
 
     # 2. Compute counts for the summary banner
     counts = {}
@@ -599,10 +566,18 @@ def draw_tracks_and_summary(frame):
     # 3. Draw summary bar with total diseases only, positioned at Y=80
     summary_text = f"total diseses : {diseased_total}"
 
-    cv2.putText(frame, summary_text, (12, 82),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)  # Black outline
-    cv2.putText(frame, summary_text, (10, 80),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)  # White text
+    cv2.putText(
+        frame, summary_text, (12, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4
+    )
+    cv2.putText(
+        frame,
+        summary_text,
+        (10, 80),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2,
+    )
 
 
 # ======================================================================
@@ -617,7 +592,7 @@ def generate_frames():
 
     with clients_lock:
         active_clients += 1
-        is_first = (active_clients == 1)
+        is_first = active_clients == 1
     if is_first:
         on_client_connected()
     print(f"[Stream] Client connected. Active: {active_clients}")
@@ -634,25 +609,26 @@ def generate_frames():
                         last_yielded = fid
 
             if frame is None:
-                time.sleep(0.005)
+                time.sleep(0.01)
                 continue
 
             draw_tracks_and_summary(frame)
 
             ok, buffer = cv2.imencode(
-                '.jpg', frame,
-                [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
             )
             if not ok:
                 continue
 
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+            )
 
     finally:
         with clients_lock:
             active_clients -= 1
-            was_last = (active_clients == 0)
+            was_last = active_clients == 0
         print(f"[Stream] Client disconnected. Active: {active_clients}")
 
         if was_last:
@@ -664,8 +640,9 @@ def generate_frames():
 # ======================================================================
 def analyze_image(frame):
     with model_lock:
-        results = model.predict(source=frame, conf=0.40,
-                                imgsz=INFER_IMGSZ, verbose=False)
+        results = model.predict(
+            source=frame, conf=0.40, imgsz=INFER_IMGSZ, verbose=False
+        )
     r0 = results[0]
 
     if r0.boxes is not None and len(r0.boxes) > 0:
@@ -687,7 +664,6 @@ def analyze_image(frame):
 
         conf = float(det.conf[0]) if det.conf is not None else 0.0
 
-        # --- EXCLUSIVE AUTOMATED LETTUCE CHECK ---
         if not is_exclusive_lettuce(frame, box, conf):
             continue
 
@@ -727,8 +703,10 @@ def save_scan_to_supabase(counts, avg_conf):
 
     try:
         supabase.table(TABLE_SCAN).insert(row).execute()
-        print(f"[Scan] Saved to {TABLE_SCAN}: {row['overall_health']} | "
-              f"healthy={healthy} diseased={diseased}")
+        print(
+            f"[Scan] Saved to {TABLE_SCAN}: {row['overall_health']} | "
+            f"healthy={healthy} diseased={diseased}"
+        )
     except Exception as e:
         print(f"[Supabase] Scan insert failed: {type(e).__name__}: {e}")
     return row
@@ -754,8 +732,10 @@ def push_notification(row):
         if row["bacterial_leaf_spot_count"]:
             parts.append(f"{row['bacterial_leaf_spot_count']} bacterial leaf spot")
         title = f"{diseased} diseased lettuce detected"
-        msg = (f"{healthy} healthy, {diseased} diseased ({', '.join(parts)}). "
-               f"Status: {row['overall_health']}")
+        msg = (
+            f"{healthy} healthy, {diseased} diseased ({', '.join(parts)}). "
+            f"Status: {row['overall_health']}"
+        )
 
     with notif_lock:
         notif_counter += 1
@@ -793,18 +773,63 @@ HTML_PAGE = """
 """
 
 
-@app.route('/')
+@app.route("/")
 def index():
     return render_template_string(HTML_PAGE)
 
 
-@app.route('/video_feed')
+@app.route("/push_frame", methods=["POST"])
+def push_frame():
+    """Receives live JPEG frames pushed over the internet by the ESP32-CAM."""
+    global latest_frame, frame_id, last_frame_push_time, pushed_frames_count
+
+    if CAM_PUSH_TOKEN:
+        token = request.headers.get("X-Cam-Token", "")
+        if token != CAM_PUSH_TOKEN:
+            return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_data()
+    if not data:
+        return jsonify({"error": "empty body"}), 400
+
+    frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        return jsonify({"error": "bad image"}), 400
+
+    with frame_lock:
+        latest_frame = frame
+        frame_id += 1
+        last_frame_push_time = time.time()
+        pushed_frames_count += 1
+        count = pushed_frames_count
+
+    if count % 50 == 1:
+        print(f"[Push] Received frame #{count} ({frame.shape[1]}x{frame.shape[0]})")
+
+    return jsonify({"ok": True, "frame_id": frame_id})
+
+
+@app.route("/cam_status")
+def cam_status():
+    with frame_lock:
+        last_push = last_frame_push_time
+        total_pushed = pushed_frames_count
+    age = round(time.time() - last_push, 2) if last_push > 0 else None
+    return jsonify({
+        "online": is_camera_online(),
+        "last_push_age_seconds": age,
+        "total_frames_pushed": total_pushed,
+    })
+
+
+@app.route("/video_feed")
 def video_feed():
-    return Response(generate_frames(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(
+        generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
 
 
-@app.route('/upload', methods=['POST'])
+@app.route("/upload", methods=["POST"])
 def upload():
     data = request.get_data()
     if not data:
@@ -819,7 +844,9 @@ def upload():
 
         total_lettuce = sum(counts.values())
         if total_lettuce == 0:
-            print("[Upload Error] Rejected: Non-lettuce or invalid image content detected.")
+            print(
+                "[Upload Error] Rejected: Non-lettuce or invalid image content detected."
+            )
             return jsonify({
                 "error": "Invalid image: No valid lettuce detected. This system is strictly exclusive for lettuce crops and lettuce diseases only."
             }), 400
@@ -833,8 +860,8 @@ def upload():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/api/notifications')
-@app.route('/notifications')
+@app.route("/api/notifications")
+@app.route("/notifications")
 def notifications_api():
     try:
         since = int(request.args.get("since", -1))
@@ -851,8 +878,8 @@ def notifications_api():
     return jsonify({"latest_id": latest, "items": items})
 
 
-@app.route('/api/counts')
-@app.route('/counts')
+@app.route("/api/counts")
+@app.route("/counts")
 def counts_api():
     with tracks_lock:
         snapshot = list(tracks)
@@ -873,6 +900,7 @@ def counts_api():
     diseased = total - healthy
 
     return jsonify({
+        "camera_online": is_camera_online(),
         "per_class": per_class,
         "total_unique_plants": total,
         "healthy": healthy,
@@ -880,8 +908,8 @@ def counts_api():
     })
 
 
-@app.route('/api/history')
-@app.route('/history')
+@app.route("/api/history")
+@app.route("/history")
 def history():
     if supabase is None:
         return jsonify({"error": "supabase not configured"})
@@ -893,17 +921,19 @@ def history():
 
     try:
         limit = int(request.args.get("limit", 50))
-        res = (supabase.table(table)
-               .select("*")
-               .order("created_at", desc=True)
-               .limit(limit)
-               .execute())
+        res = (
+            supabase.table(table)
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
         return jsonify({"source": source, "records": res.data or []})
     except Exception as e:
         return jsonify({"error": str(e)})
 
 
-@app.route('/session/force_save', methods=['POST'])
+@app.route("/session/force_save", methods=["POST"])
 def force_save_session():
     ok = save_session_to_supabase()
     return jsonify({"saved": ok})
@@ -912,13 +942,9 @@ def force_save_session():
 # ======================================================================
 # Main
 # ======================================================================
-if __name__ == '__main__':
-    threading.Thread(target=reader_thread, daemon=True).start()
+if __name__ == "__main__":
     threading.Thread(target=inference_thread, daemon=True).start()
     # threading.Thread(target=session_flush_thread, daemon=True).start()
-    print("[Main] Threads started. Serving on http://0.0.0.0:5000")
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
-
-if __name__ == '__main__':
-    print("[Main] Serving locally on http://0.0.0.0:5000")
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    port = int(os.environ.get("PORT", 5000))
+    print(f"[Main] Inference thread started. Serving on http://0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
