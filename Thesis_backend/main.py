@@ -42,12 +42,13 @@ if SUPABASE_KEY:
     except Exception as e:
         print(f"[Supabase] Init failed: {e}")
 
-# ---------- Tuning, Camera Height & Filtering ----------
+# ---------- Tuning, Anti-False-Positive & Camera Height ----------
 INFER_INTERVAL = float(os.environ.get("INFER_INTERVAL", "0.5"))
 INFER_IMGSZ = int(os.environ.get("INFER_IMGSZ", "512"))
-CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.15"))
-MIN_FOLIAGE_RATIO = float(os.environ.get("MIN_FOLIAGE_RATIO", "0.005"))
-MIN_BOX_PX = int(os.environ.get("MIN_BOX_PX", "5"))
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.25"))
+DISEASE_MIN_CONF = float(os.environ.get("DISEASE_MIN_CONF", "0.35"))
+MIN_FOLIAGE_RATIO = float(os.environ.get("MIN_FOLIAGE_RATIO", "0.01"))
+MIN_BOX_PX = int(os.environ.get("MIN_BOX_PX", "8"))
 
 # Camera height & scale adaptation when camera mount height changes
 CAMERA_HEIGHT_CM = float(os.environ.get("CAMERA_HEIGHT_CM", "45.0"))
@@ -55,14 +56,14 @@ REF_BOX_HEIGHT_RATIO = float(os.environ.get("REF_BOX_HEIGHT_RATIO", "0.35"))
 MIN_HEIGHT_RATIO = float(os.environ.get("MIN_HEIGHT_RATIO", "0.02"))
 FAR_ZOOM_MARGIN = float(os.environ.get("FAR_ZOOM_MARGIN", "0.0"))
 
-# Bounding box smoothing factor (0.15 = very smooth, 0.5 = faster response)
+# Bounding box smoothing & confirmation stability
 SMOOTH_ALPHA = float(os.environ.get("SMOOTH_ALPHA", "0.25"))
 DEBUG_DETECTIONS = os.environ.get("DEBUG_DETECTIONS", "1") == "1"
 
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "75"))
 MEMORY_TIME = 15.0
-IOU_MATCH_THRESHOLD = 0.15
-MIN_FRAMES_TO_CONFIRM = 1
+IOU_MATCH_THRESHOLD = 0.20
+MIN_FRAMES_TO_CONFIRM = int(os.environ.get("MIN_FRAMES_TO_CONFIRM", "2"))
 
 SESSION_FLUSH_INTERVAL = 60  # seconds
 MIN_CONFIRMED_TO_SAVE = 1
@@ -77,6 +78,11 @@ COLOR_MAP = {
 DEFAULT_COLOR = (200, 200, 200)
 
 VALID_CLASSES = {name.lower() for name in COLOR_MAP.keys()}
+DISEASE_CLASSES = {
+    "downy mildew",
+    "powdery mildew",
+    "bacterial leaf spot",
+}
 
 
 def normalize_class_name(raw_name: str) -> str:
@@ -131,15 +137,17 @@ def prepare_inference_view(frame):
     return cropped, x1, y1
 
 
-def check_lettuce_box(frame, box, conf):
+def check_lettuce_box(frame, box, conf, cls_name=""):
     """
-    Validates box dimensions, confidence, height ratio, and broad foliage HSV range.
+    Validates box dimensions, class-aware confidence, height ratio, and foliage HSV range.
     Returns (True, "ok", metrics) or (False, reason, metrics).
     """
     metrics = compute_height_metrics(box, frame.shape)
+    norm_cls = normalize_class_name(cls_name)
 
-    if conf < CONF_THRESHOLD:
-        return False, f"low_conf({conf:.2f}<{CONF_THRESHOLD:.2f})", metrics
+    min_conf = DISEASE_MIN_CONF if norm_cls in DISEASE_CLASSES else CONF_THRESHOLD
+    if conf < min_conf:
+        return False, f"low_conf({conf:.2f}<{min_conf:.2f})", metrics
 
     if metrics["height_ratio"] < MIN_HEIGHT_RATIO:
         return (
@@ -169,7 +177,7 @@ def check_lettuce_box(frame, box, conf):
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
 
         # Broad green / yellow-green / pale / diseased-lesion plant range
-        lower_foliage = np.array([5, 8, 8])
+        lower_foliage = np.array([5, 10, 12])
         upper_foliage = np.array([115, 255, 255])
 
         mask = cv2.inRange(hsv, lower_foliage, upper_foliage)
@@ -189,8 +197,8 @@ def check_lettuce_box(frame, box, conf):
         return True, f"fallback({e})", metrics
 
 
-def is_exclusive_lettuce(frame, box, conf) -> bool:
-    ok, _, _ = check_lettuce_box(frame, box, conf)
+def is_exclusive_lettuce(frame, box, conf, cls_name="") -> bool:
+    ok, _, _ = check_lettuce_box(frame, box, conf, cls_name=cls_name)
     return ok
 
 
@@ -303,7 +311,6 @@ class Track:
             v["conf_sum"] += float(conf)
 
     def get_smoothed_box(self):
-        # Blend slightly toward latest raw box when stationary to prevent lag
         alpha = max(0.05, min(1.0, SMOOTH_ALPHA))
         blended = [
             (1.0 - alpha) * s + alpha * float(r)
@@ -316,16 +323,23 @@ class Track:
         return sum(v["count"] for v in self.cls_votes.values())
 
     def best_class(self):
-        return max(
-            self.cls_votes.items(),
-            key=lambda kv: (kv[1]["count"], kv[1]["conf_sum"]),
-        )[0]
+        # Prefer healthy if votes are tied and healthy is present
+        best_id = None
+        best_score = None
+        for cid, stats in self.cls_votes.items():
+            cname = normalize_class_name(model.names.get(cid, ""))
+            healthy_bonus = 0.05 if cname == "healthy" else 0.0
+            score = (stats["count"], round(stats["conf_sum"] + healthy_bonus, 6))
+            if best_score is None or score > best_score:
+                best_score = score
+                best_id = cid
+        return best_id
 
     def best_confidence(self):
-        _, stats = max(
-            self.cls_votes.items(),
-            key=lambda kv: (kv[1]["count"], kv[1]["conf_sum"]),
-        )
+        cid = self.best_class()
+        stats = self.cls_votes.get(cid)
+        if not stats or stats["count"] <= 0:
+            return self.last_conf
         return stats["conf_sum"] / stats["count"]
 
     def confirmed(self):
@@ -565,6 +579,7 @@ def extract_box(det, offset_x=0, offset_y=0):
 def inference_thread():
     last_infer = 0.0
     last_seen_frame = -1
+    raw_predict_conf = min(CONF_THRESHOLD, DISEASE_MIN_CONF)
     while True:
         now = time.time()
         if now - last_infer < INFER_INTERVAL:
@@ -590,7 +605,7 @@ def inference_thread():
             with model_lock:
                 results = model.predict(
                     source=infer_view,
-                    conf=CONF_THRESHOLD,
+                    conf=raw_predict_conf,
                     imgsz=INFER_IMGSZ,
                     verbose=False,
                 )
@@ -620,7 +635,9 @@ def inference_thread():
                     rejected_reasons.append(f"{raw_name}({conf:.2f}):no_box")
                     continue
 
-                ok, reason, metrics = check_lettuce_box(frame, box, conf)
+                ok, reason, metrics = check_lettuce_box(
+                    frame, box, conf, cls_name=cls_name
+                )
                 if not ok:
                     rejected_reasons.append(f"{cls_name}({conf:.2f}):{reason}")
                     continue
@@ -655,10 +672,10 @@ def draw_tracks_and_summary(frame):
     with tracks_lock:
         snapshot = list(tracks)
 
-    # 1. Draw smooth bounding boxes for active tracks
+    # 1. Draw smooth bounding boxes for confirmed active tracks
     for tr in snapshot:
         age = now - tr.last_seen
-        if age > MEMORY_TIME:
+        if age > MEMORY_TIME or not tr.confirmed():
             continue
         cls_id = tr.best_class()
         raw_name = model.names.get(cls_id, str(cls_id))
@@ -781,9 +798,13 @@ def generate_frames():
 # ======================================================================
 def analyze_image(frame):
     infer_view, ox, oy = prepare_inference_view(frame)
+    raw_predict_conf = min(CONF_THRESHOLD, DISEASE_MIN_CONF)
     with model_lock:
         results = model.predict(
-            source=infer_view, conf=CONF_THRESHOLD, imgsz=INFER_IMGSZ, verbose=False
+            source=infer_view,
+            conf=raw_predict_conf,
+            imgsz=INFER_IMGSZ,
+            verbose=False,
         )
     r0 = results[0]
 
@@ -806,7 +827,7 @@ def analyze_image(frame):
 
         conf = float(det.conf[0]) if det.conf is not None else 0.0
 
-        if not is_exclusive_lettuce(frame, box, conf):
+        if not is_exclusive_lettuce(frame, box, conf, cls_name=name):
             continue
 
         counts[name] = counts.get(name, 0) + 1
