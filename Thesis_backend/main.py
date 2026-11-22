@@ -42,7 +42,7 @@ if SUPABASE_KEY:
     except Exception as e:
         print(f"[Supabase] Init failed: {e}")
 
-# ---------- Tuning, Camera Height & Automated Lettuce Filtering ----------
+# ---------- Tuning, Anti-False-Positive & Camera Height ----------
 INFER_INTERVAL = float(os.environ.get("INFER_INTERVAL", "0.5"))
 INFER_IMGSZ = int(os.environ.get("INFER_IMGSZ", "512"))
 CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.25"))
@@ -50,13 +50,13 @@ DISEASE_MIN_CONF = float(os.environ.get("DISEASE_MIN_CONF", "0.35"))
 MIN_FOLIAGE_RATIO = float(os.environ.get("MIN_FOLIAGE_RATIO", "0.01"))
 MIN_BOX_PX = int(os.environ.get("MIN_BOX_PX", "8"))
 
-# Camera height & scale adaptation when camera mount height is adjusted
+# Camera height & scale adaptation when camera mount height changes
 CAMERA_HEIGHT_CM = float(os.environ.get("CAMERA_HEIGHT_CM", "45.0"))
 REF_BOX_HEIGHT_RATIO = float(os.environ.get("REF_BOX_HEIGHT_RATIO", "0.35"))
 MIN_HEIGHT_RATIO = float(os.environ.get("MIN_HEIGHT_RATIO", "0.02"))
 FAR_ZOOM_MARGIN = float(os.environ.get("FAR_ZOOM_MARGIN", "0.0"))
 
-# Bounding box smoothing & tracking stability
+# Bounding box smoothing & confirmation stability
 SMOOTH_ALPHA = float(os.environ.get("SMOOTH_ALPHA", "0.25"))
 DEBUG_DETECTIONS = os.environ.get("DEBUG_DETECTIONS", "1") == "1"
 
@@ -115,7 +115,7 @@ def compute_height_metrics(box, frame_shape):
 
 def prepare_inference_view(frame):
     """
-    Optional center zoom crop when camera is mounted high/far; returns (view, ox, oy).
+    Optional center crop when camera is mounted high/far; returns (view, ox, oy).
     """
     margin = max(0.0, min(0.4, FAR_ZOOM_MARGIN))
     if margin <= 0.0:
@@ -139,10 +139,7 @@ def prepare_inference_view(frame):
 
 def check_lettuce_box(frame, box, conf, cls_name=""):
     """
-    Lettuce-Exclusive Validation Filter:
-    1. Enforces class-aware confidence (CONF_THRESHOLD for healthy, DISEASE_MIN_CONF for diseases).
-    2. Enforces minimum height_ratio and box dimensions for camera-height changes.
-    3. Uses HSV color space masking to verify plant foliage pigment.
+    Validates box dimensions, class-aware confidence, height ratio, and foliage HSV range.
     Returns (True, "ok", metrics) or (False, reason, metrics).
     """
     metrics = compute_height_metrics(box, frame.shape)
@@ -179,7 +176,7 @@ def check_lettuce_box(frame, box, conf, cls_name=""):
 
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
 
-        # HSV range covering healthy greens and diseased yellow-greens / lesions
+        # Broad green / yellow-green / pale / diseased-lesion plant range
         lower_foliage = np.array([5, 10, 12])
         upper_foliage = np.array([115, 255, 255])
 
@@ -326,6 +323,7 @@ class Track:
         return sum(v["count"] for v in self.cls_votes.values())
 
     def best_class(self):
+        # Prefer healthy if votes are tied and healthy is present
         best_id = None
         best_score = None
         for cid, stats in self.cls_votes.items():
