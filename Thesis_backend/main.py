@@ -1,9 +1,11 @@
 import cv2
 import time
+import io
 import threading
 import os
 import json
 import numpy as np
+import requests
 from collections import deque
 from datetime import datetime
 from flask import Flask, Response, render_template_string, jsonify, request
@@ -17,7 +19,11 @@ app = Flask(__name__)
 model = YOLO("best.pt")
 print(f"This model can detect: {model.names}")
 
+ESP32_CAM_URL = os.environ.get("ESP32_CAM_URL", "http://192.168.1.119:81/stream")
+ENABLE_LAN_READER = os.environ.get("ENABLE_LAN_READER", "0") == "1"
+
 # Optional shared secret so random internet traffic cannot spoof ESP32 frames.
+# Set CAM_PUSH_TOKEN in both ESP32 code and Railway env vars if desired.
 CAM_PUSH_TOKEN = os.environ.get("CAM_PUSH_TOKEN", "")
 CAM_ONLINE_TIMEOUT = 10.0  # seconds without a pushed frame before marking camera offline
 
@@ -420,6 +426,66 @@ def session_flush_thread():
                     next_track_id = 1
                 session_start_time = time.time()
                 print("[Session] Flush complete. Window restarted.")
+
+
+# ======================================================================
+# Reader thread (Optional LAN stream reader; use /push_frame over internet)
+# ======================================================================
+def reader_thread():
+    global latest_frame, frame_id, last_frame_push_time
+    session = requests.Session()
+    backoff = 1
+
+    while True:
+        try:
+            print(f"[Reader] Connecting to {ESP32_CAM_URL}")
+            resp = session.get(
+                ESP32_CAM_URL,
+                stream=True,
+                timeout=(3, 5),
+                headers={"Cache-Control": "no-cache"},
+            )
+            resp.raise_for_status()
+            print("[Reader] Connected.")
+            backoff = 1
+            buf = bytearray()
+
+            for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+
+                last_jpg = None
+                while True:
+                    a = buf.find(b"\xff\xd8")
+                    if a == -1:
+                        buf.clear()
+                        break
+                    b = buf.find(b"\xff\xd9", a + 2)
+                    if b == -1:
+                        if a > 0:
+                            del buf[:a]
+                        break
+                    last_jpg = bytes(buf[a : b + 2])
+                    del buf[: b + 2]
+
+                if len(buf) > 4_000_000:
+                    buf.clear()
+
+                if last_jpg is not None:
+                    frame = cv2.imdecode(
+                        np.frombuffer(last_jpg, np.uint8), cv2.IMREAD_COLOR
+                    )
+                    if frame is not None:
+                        with frame_lock:
+                            latest_frame = frame
+                            frame_id += 1
+                            last_frame_push_time = time.time()
+
+        except Exception as e:
+            print(f"[Reader] Connection dropped: {e}. Reconnecting in {backoff}s...")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 10)
 
 
 # ======================================================================
@@ -964,6 +1030,8 @@ ensure_inference_thread()
 # ======================================================================
 if __name__ == "__main__":
     ensure_inference_thread()
+    if ENABLE_LAN_READER:
+        threading.Thread(target=reader_thread, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     print(f"[Main] Inference thread started. Serving on http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
