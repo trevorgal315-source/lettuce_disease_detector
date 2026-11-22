@@ -27,6 +27,7 @@ ENABLE_LAN_READER = os.environ.get("ENABLE_LAN_READER", "0") == "1"
 # Set CAM_PUSH_TOKEN in both ESP32 code and Railway env vars if desired.
 CAM_PUSH_TOKEN = os.environ.get("CAM_PUSH_TOKEN", "")
 CAM_ONLINE_TIMEOUT = 10.0  # seconds without a pushed frame before marking camera offline
+CLIENT_IDLE_TIMEOUT = 12.0  # seconds without yielding a frame before ending client
 
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get(
@@ -58,6 +59,7 @@ MEMORY_TIME = 15.0
 CHUNK_SIZE = 8192
 IOU_MATCH_THRESHOLD = 0.15
 MIN_FRAMES_TO_CONFIRM = 1
+CONF_THRESHOLD = 0.25
 
 SESSION_FLUSH_INTERVAL = 60  # seconds (optional periodic flush if enabled)
 ENABLE_PERIODIC_FLUSH = os.environ.get("ENABLE_PERIODIC_FLUSH", "0") == "1"
@@ -82,11 +84,11 @@ def get_class_color(class_name: str):
 def is_exclusive_lettuce(frame, box, conf) -> bool:
     """
     Lettuce-Exclusive Validation Filter:
-    1. Enforces a confidence floor (0.40) to allow valid detections.
+    1. Enforces a confidence floor (0.25) to allow valid healthy & infected detections.
     2. Uses a broader HSV color space mask to verify plant foliage and
-       accommodate dark greens, yellow-greens, and disease lesions.
+       accommodate dark greens, yellow-greens, bright highlights, and lesions.
     """
-    if conf < 0.40:
+    if conf < CONF_THRESHOLD:
         return False
 
     try:
@@ -100,7 +102,7 @@ def is_exclusive_lettuce(frame, box, conf) -> bool:
         box_width = x2 - x1
         box_height = y2 - y1
 
-        if box_width <= 10 or box_height <= 10:
+        if box_width <= 8 or box_height <= 8:
             return False
 
         crop = frame[y1:y2, x1:x2]
@@ -116,7 +118,7 @@ def is_exclusive_lettuce(frame, box, conf) -> bool:
         total_pixels = box_width * box_height
 
         foliage_ratio = foliage_pixel_count / float(total_pixels)
-        if foliage_ratio < 0.03:
+        if foliage_ratio < 0.01:
             return False
 
         return True
@@ -296,10 +298,8 @@ def _build_session_row():
 
     counts = {}
     confs = []
-    for _, class_name in confirmed:
+    for tr, class_name in confirmed:
         counts[class_name] = counts.get(class_name, 0) + 1
-
-    for tr, _ in confirmed:
         confs.append(tr.best_confidence())
 
     healthy = counts.get("healthy", 0)
@@ -357,7 +357,6 @@ def save_session_to_supabase(force: bool = False):
         return False
 
     if row is None and force:
-        # Force save fallback when tracks are empty so explicit saves/exits can still record if needed
         with session_lock:
             start_ts = session_start_time
         duration = int(time.time() - start_ts) if start_ts else 0
@@ -404,8 +403,9 @@ def save_session_to_supabase(force: bool = False):
     try:
         supabase.table(TABLE_LIVE).insert(row).execute()
         print(
-            f"[Session] Saved to {TABLE_LIVE}: plants={row['total_unique_plants']} "
-            f"diseases={row['total_diseases_detected']} image_url={bool(image_url)}"
+            f"[Session] Saved to {TABLE_LIVE}: status={row['overall_health']} "
+            f"healthy={row['healthy_count']} diseases={row['total_diseases_detected']} "
+            f"image_url={bool(image_url)}"
         )
         return True
     except Exception as e:
@@ -609,7 +609,7 @@ def inference_thread():
         try:
             with model_lock:
                 results = model.predict(
-                    source=frame, conf=0.40, imgsz=INFER_IMGSZ, verbose=False
+                    source=frame, conf=CONF_THRESHOLD, imgsz=INFER_IMGSZ, verbose=False
                 )
             r0 = results[0]
 
@@ -747,36 +747,51 @@ def generate_frames():
     print(f"[Stream] Client connected. Active: {active_clients}")
 
     last_yielded = -1
+    last_active_at = time.time()
+
     try:
         while True:
+            now = time.time()
             frame = None
+            fid = last_yielded
+
             with frame_lock:
-                if latest_frame is not None:
+                if latest_frame is not None and frame_id != last_yielded:
                     fid = frame_id
-                    if fid != last_yielded:
-                        frame = latest_frame.copy()
-                        last_yielded = fid
+                    frame = latest_frame.copy()
 
             if frame is None:
-                time.sleep(0.005)
+                if (now - last_active_at) >= CLIENT_IDLE_TIMEOUT:
+                    print(
+                        f"[Stream] Client inactive for {CLIENT_IDLE_TIMEOUT:.0f}s. Ending stream."
+                    )
+                    break
+                time.sleep(0.02)
                 continue
 
             draw_tracks_and_summary(frame)
-
             ok, buffer = cv2.imencode(
                 ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
             )
             if not ok:
+                time.sleep(0.02)
                 continue
+
+            last_yielded = fid
+            last_active_at = time.time()
 
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
             )
 
+    except GeneratorExit:
+        print("[Stream] Client closed connection.")
+    except Exception as e:
+        print(f"[Stream] Client stream error ({type(e).__name__}): {e}")
     finally:
         with clients_lock:
-            active_clients -= 1
+            active_clients = max(0, active_clients - 1)
             was_last = active_clients == 0
         print(f"[Stream] Client disconnected. Active: {active_clients}")
 
@@ -790,7 +805,7 @@ def generate_frames():
 def analyze_image(frame):
     with model_lock:
         results = model.predict(
-            source=frame, conf=0.40, imgsz=INFER_IMGSZ, verbose=False
+            source=frame, conf=CONF_THRESHOLD, imgsz=INFER_IMGSZ, verbose=False
         )
     r0 = results[0]
 
@@ -803,7 +818,11 @@ def analyze_image(frame):
 
     counts, confs = {}, []
     for det in dets:
-        name = model.names.get(int(det.cls[0]), "").strip().lower()
+        cls_id = int(det.cls[0])
+        name = model.names.get(cls_id, "").strip().lower()
+        conf = float(det.conf[0]) if det.conf is not None else 0.0
+        print(f"[Analyze] Raw det: class={name} ({cls_id}) conf={conf:.3f}")
+
         if name not in VALID_CLASSES:
             continue
 
@@ -811,9 +830,8 @@ def analyze_image(frame):
         if box is None:
             continue
 
-        conf = float(det.conf[0]) if det.conf is not None else 0.0
-
         if not is_exclusive_lettuce(frame, box, conf):
+            print(f"[Analyze] Filtered out by is_exclusive_lettuce: {name} conf={conf:.3f}")
             continue
 
         counts[name] = counts.get(name, 0) + 1
