@@ -20,7 +20,7 @@ print(f"This model can detect: {model.names}")
 # Optional shared secret so random internet traffic cannot spoof ESP32 frames.
 # Set CAM_PUSH_TOKEN in both ESP32 code and Railway env vars if desired.
 CAM_PUSH_TOKEN = os.environ.get("CAM_PUSH_TOKEN", "")
-CAM_ONLINE_TIMEOUT = 8.0  # seconds without a pushed frame before marking camera offline
+CAM_ONLINE_TIMEOUT = 10.0  # seconds without a pushed frame before marking camera offline
 
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get(
@@ -44,9 +44,10 @@ if SUPABASE_KEY:
         print(f"[Supabase] Init failed: {e}")
 
 # ---------- Tuning & Automated Lettuce-Exclusive Filtering ----------
-INFER_INTERVAL = 0.15
-INFER_IMGSZ = 640
-JPEG_QUALITY = 80
+# Tuned for shared CPU on Railway to reduce 499s and HTTP -11 read timeouts
+INFER_INTERVAL = float(os.environ.get("INFER_INTERVAL", "0.6"))
+INFER_IMGSZ = int(os.environ.get("INFER_IMGSZ", "416"))
+JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "75"))
 MEMORY_TIME = 15.0
 IOU_MATCH_THRESHOLD = 0.15
 MIN_FRAMES_TO_CONFIRM = 1
@@ -446,7 +447,7 @@ def inference_thread():
     while True:
         now = time.time()
         if now - last_infer < INFER_INTERVAL:
-            time.sleep(0.01)
+            time.sleep(0.05)
             continue
 
         frame = None
@@ -457,7 +458,7 @@ def inference_thread():
                 frame = latest_frame.copy()
 
         if frame is None or fid == last_seen_frame:
-            time.sleep(0.02)
+            time.sleep(0.05)
             continue
 
         last_seen_frame = fid
@@ -609,7 +610,7 @@ def generate_frames():
                         last_yielded = fid
 
             if frame is None:
-                time.sleep(0.01)
+                time.sleep(0.05)
                 continue
 
             draw_tracks_and_summary(frame)
@@ -624,6 +625,7 @@ def generate_frames():
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
             )
+            time.sleep(0.05)
 
     finally:
         with clients_lock:
