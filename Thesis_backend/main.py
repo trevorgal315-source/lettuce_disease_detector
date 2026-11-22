@@ -18,7 +18,6 @@ model = YOLO("best.pt")
 print(f"This model can detect: {model.names}")
 
 # Optional shared secret so random internet traffic cannot spoof ESP32 frames.
-# Set CAM_PUSH_TOKEN in both ESP32 code and Railway env vars if desired.
 CAM_PUSH_TOKEN = os.environ.get("CAM_PUSH_TOKEN", "")
 CAM_ONLINE_TIMEOUT = 10.0  # seconds without a pushed frame before marking camera offline
 
@@ -43,15 +42,21 @@ if SUPABASE_KEY:
     except Exception as e:
         print(f"[Supabase] Init failed: {e}")
 
-# ---------- Tuning & Automated Lettuce-Exclusive Filtering ----------
-# Tuned for higher/farther camera mounting while protecting Railway CPU against 499s
-INFER_INTERVAL = float(os.environ.get("INFER_INTERVAL", "0.8"))
-INFER_IMGSZ = int(os.environ.get("INFER_IMGSZ", "640"))
-CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.18"))
-MIN_FOLIAGE_RATIO = float(os.environ.get("MIN_FOLIAGE_RATIO", "0.01"))
-MIN_BOX_PX = int(os.environ.get("MIN_BOX_PX", "6"))
-# Optional center zoom margin (0.0 = full frame, 0.25 = crops inner 50% width & height)
+# ---------- Tuning, Camera Height & Filtering ----------
+INFER_INTERVAL = float(os.environ.get("INFER_INTERVAL", "0.5"))
+INFER_IMGSZ = int(os.environ.get("INFER_IMGSZ", "512"))
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.15"))
+MIN_FOLIAGE_RATIO = float(os.environ.get("MIN_FOLIAGE_RATIO", "0.005"))
+MIN_BOX_PX = int(os.environ.get("MIN_BOX_PX", "5"))
+
+# Camera height & scale adaptation when camera mount height changes
+CAMERA_HEIGHT_CM = float(os.environ.get("CAMERA_HEIGHT_CM", "45.0"))
+REF_BOX_HEIGHT_RATIO = float(os.environ.get("REF_BOX_HEIGHT_RATIO", "0.35"))
+MIN_HEIGHT_RATIO = float(os.environ.get("MIN_HEIGHT_RATIO", "0.02"))
 FAR_ZOOM_MARGIN = float(os.environ.get("FAR_ZOOM_MARGIN", "0.0"))
+
+# Bounding box smoothing factor (0.15 = very smooth, 0.5 = faster response)
+SMOOTH_ALPHA = float(os.environ.get("SMOOTH_ALPHA", "0.25"))
 DEBUG_DETECTIONS = os.environ.get("DEBUG_DETECTIONS", "1") == "1"
 
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "75"))
@@ -74,14 +79,37 @@ DEFAULT_COLOR = (200, 200, 200)
 VALID_CLASSES = {name.lower() for name in COLOR_MAP.keys()}
 
 
+def normalize_class_name(raw_name: str) -> str:
+    return raw_name.replace("_", " ").strip().lower()
+
+
 def get_class_color(class_name: str):
-    return COLOR_MAP.get(class_name.strip().lower(), DEFAULT_COLOR)
+    return COLOR_MAP.get(normalize_class_name(class_name), DEFAULT_COLOR)
+
+
+def compute_height_metrics(box, frame_shape):
+    """
+    Computes bounding-box height in pixels, relative height ratio in the frame,
+    and an estimated height in cm calibrated against CAMERA_HEIGHT_CM and REF_BOX_HEIGHT_RATIO.
+    """
+    h, w = frame_shape[0], frame_shape[1]
+    x1, y1, x2, y2 = box
+    box_h = max(1.0, float(y2 - y1))
+    box_w = max(1.0, float(x2 - x1))
+    height_ratio = box_h / max(1.0, float(h))
+    ref_ratio = max(0.01, REF_BOX_HEIGHT_RATIO)
+    est_height_cm = round((height_ratio / ref_ratio) * (CAMERA_HEIGHT_CM * 0.25), 1)
+    return {
+        "box_width_px": int(round(box_w)),
+        "box_height_px": int(round(box_h)),
+        "height_ratio": round(height_ratio, 4),
+        "est_height_cm": est_height_cm,
+    }
 
 
 def prepare_inference_view(frame):
     """
-    Applies optional center zoom crop for distant/high camera mounting and
-    returns (view_frame, offset_x, offset_y) so boxes map back to original frame coordinates.
+    Optional center crop when camera is mounted high/far; returns (view, ox, oy).
     """
     margin = max(0.0, min(0.4, FAR_ZOOM_MARGIN))
     if margin <= 0.0:
@@ -105,11 +133,20 @@ def prepare_inference_view(frame):
 
 def check_lettuce_box(frame, box, conf):
     """
-    Validates box dimensions, confidence, and broad foliage HSV range.
-    Returns (True, "ok") or (False, reason).
+    Validates box dimensions, confidence, height ratio, and broad foliage HSV range.
+    Returns (True, "ok", metrics) or (False, reason, metrics).
     """
+    metrics = compute_height_metrics(box, frame.shape)
+
     if conf < CONF_THRESHOLD:
-        return False, f"low_conf({conf:.2f}<{CONF_THRESHOLD:.2f})"
+        return False, f"low_conf({conf:.2f}<{CONF_THRESHOLD:.2f})", metrics
+
+    if metrics["height_ratio"] < MIN_HEIGHT_RATIO:
+        return (
+            False,
+            f"too_small_height({metrics['height_ratio']:.4f}<{MIN_HEIGHT_RATIO:.4f})",
+            metrics,
+        )
 
     try:
         x1, y1, x2, y2 = box
@@ -123,17 +160,17 @@ def check_lettuce_box(frame, box, conf):
         box_height = y2 - y1
 
         if box_width <= MIN_BOX_PX or box_height <= MIN_BOX_PX:
-            return False, f"small_box({box_width}x{box_height})"
+            return False, f"small_box({box_width}x{box_height})", metrics
 
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
-            return False, "empty_crop"
+            return False, "empty_crop", metrics
 
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
 
-        # Broad green / yellow-green / pale / dark-spot plant range
+        # Broad green / yellow-green / pale / diseased-lesion plant range
         lower_foliage = np.array([5, 8, 8])
-        upper_foliage = np.array([110, 255, 255])
+        upper_foliage = np.array([115, 255, 255])
 
         mask = cv2.inRange(hsv, lower_foliage, upper_foliage)
         foliage_pixel_count = cv2.countNonZero(mask)
@@ -141,15 +178,19 @@ def check_lettuce_box(frame, box, conf):
         foliage_ratio = foliage_pixel_count / total_pixels
 
         if foliage_ratio < MIN_FOLIAGE_RATIO:
-            return False, f"low_foliage({foliage_ratio:.3f}<{MIN_FOLIAGE_RATIO:.3f})"
+            return (
+                False,
+                f"low_foliage({foliage_ratio:.4f}<{MIN_FOLIAGE_RATIO:.4f})",
+                metrics,
+            )
 
-        return True, "ok"
+        return True, "ok", metrics
     except Exception as e:
-        return True, f"fallback({e})"
+        return True, f"fallback({e})", metrics
 
 
 def is_exclusive_lettuce(frame, box, conf) -> bool:
-    ok, _ = check_lettuce_box(frame, box, conf)
+    ok, _, _ = check_lettuce_box(frame, box, conf)
     return ok
 
 
@@ -216,28 +257,60 @@ session_start_time = None
 
 
 # ======================================================================
-# Tracker
+# Smooth Tracker
 # ======================================================================
 class Track:
-    __slots__ = ("track_id", "cls_votes", "box", "last_seen", "last_conf")
+    __slots__ = (
+        "track_id",
+        "cls_votes",
+        "box",
+        "smooth_box",
+        "last_seen",
+        "last_conf",
+        "smooth_conf",
+        "height_info",
+    )
 
-    def __init__(self, track_id, cls_id, conf, box, now):
+    def __init__(self, track_id, cls_id, conf, box, now, height_info=None):
         self.track_id = track_id
         self.cls_votes = {cls_id: {"count": 1, "conf_sum": float(conf)}}
         self.box = box
+        self.smooth_box = tuple(float(v) for v in box)
         self.last_seen = now
         self.last_conf = float(conf)
+        self.smooth_conf = float(conf)
+        self.height_info = height_info or {}
 
-    def update(self, cls_id, conf, box, now):
+    def update(self, cls_id, conf, box, now, height_info=None):
         self.box = box
         self.last_seen = now
         self.last_conf = float(conf)
+        if height_info:
+            self.height_info = height_info
+
+        alpha = max(0.05, min(1.0, SMOOTH_ALPHA))
+        self.smooth_box = tuple(
+            (1.0 - alpha) * s + alpha * float(c)
+            for s, c in zip(self.smooth_box, box)
+        )
+        self.smooth_conf = (1.0 - alpha) * self.smooth_conf + alpha * float(conf)
+
         v = self.cls_votes.get(cls_id)
         if v is None:
             self.cls_votes[cls_id] = {"count": 1, "conf_sum": float(conf)}
         else:
             v["count"] += 1
             v["conf_sum"] += float(conf)
+
+    def get_smoothed_box(self):
+        # Blend slightly toward latest raw box when stationary to prevent lag
+        alpha = max(0.05, min(1.0, SMOOTH_ALPHA))
+        blended = [
+            (1.0 - alpha) * s + alpha * float(r)
+            for s, r in zip(self.smooth_box, self.box)
+        ]
+        self.smooth_box = tuple(blended)
+        return tuple(int(round(v)) for v in blended)
 
     def total_seen(self):
         return sum(v["count"] for v in self.cls_votes.values())
@@ -290,11 +363,24 @@ def tracker_update(detections, now):
                     best_iou = iou
                     best_idx = i
             if best_idx >= 0:
-                tracks[best_idx].update(det["cls_id"], det["conf"], det["box"], now)
+                tracks[best_idx].update(
+                    det["cls_id"],
+                    det["conf"],
+                    det["box"],
+                    now,
+                    det.get("height_info"),
+                )
                 used[best_idx] = True
             else:
                 tracks.append(
-                    Track(next_track_id, det["cls_id"], det["conf"], det["box"], now)
+                    Track(
+                        next_track_id,
+                        det["cls_id"],
+                        det["conf"],
+                        det["box"],
+                        now,
+                        det.get("height_info"),
+                    )
                 )
                 used.append(True)
                 next_track_id += 1
@@ -314,7 +400,7 @@ def _build_session_row():
         if not tr.confirmed():
             continue
         cls_id = tr.best_class()
-        class_name = model.names.get(cls_id, f"class_{cls_id}").strip().lower()
+        class_name = normalize_class_name(model.names.get(cls_id, f"class_{cls_id}"))
         if class_name not in VALID_CLASSES:
             continue
         confirmed.append((tr, class_name))
@@ -522,7 +608,7 @@ def inference_thread():
             for det in dets:
                 cls_id = int(det.cls[0])
                 raw_name = model.names.get(cls_id, f"class_{cls_id}")
-                cls_name = raw_name.strip().lower()
+                cls_name = normalize_class_name(raw_name)
                 conf = float(det.conf[0]) if det.conf is not None else 0.0
 
                 if cls_name not in VALID_CLASSES:
@@ -534,24 +620,25 @@ def inference_thread():
                     rejected_reasons.append(f"{raw_name}({conf:.2f}):no_box")
                     continue
 
-                ok, reason = check_lettuce_box(frame, box, conf)
+                ok, reason, metrics = check_lettuce_box(frame, box, conf)
                 if not ok:
-                    rejected_reasons.append(f"{raw_name}({conf:.2f}):{reason}")
+                    rejected_reasons.append(f"{cls_name}({conf:.2f}):{reason}")
                     continue
 
                 clean.append({
                     "cls_id": cls_id,
                     "conf": conf,
                     "box": box,
+                    "height_info": metrics,
                 })
 
-            if DEBUG_DETECTIONS and fid % 10 == 1:
+            if DEBUG_DETECTIONS and fid % 8 == 1:
                 kept_summary = [
-                    f"{model.names.get(d['cls_id'], d['cls_id'])}({d['conf']:.2f})"
+                    f"{normalize_class_name(model.names.get(d['cls_id'], str(d['cls_id'])))}({d['conf']:.2f},h={d['height_info'].get('box_height_px', 0)}px)"
                     for d in clean
                 ]
                 print(
-                    f"[Infer fid={fid}] kept={kept_summary} rejected={rejected_reasons}"
+                    f"[Infer fid={fid} cam_h={CAMERA_HEIGHT_CM}cm] kept={kept_summary} rejected={rejected_reasons}"
                 )
 
             tracker_update(clean, now)
@@ -568,31 +655,35 @@ def draw_tracks_and_summary(frame):
     with tracks_lock:
         snapshot = list(tracks)
 
-    # 1. Draw bounding boxes for active confirmed tracks
+    # 1. Draw smooth bounding boxes for active tracks
     for tr in snapshot:
         age = now - tr.last_seen
         if age > MEMORY_TIME:
             continue
         cls_id = tr.best_class()
-        name = model.names.get(cls_id, "").strip().lower()
+        raw_name = model.names.get(cls_id, str(cls_id))
+        name = normalize_class_name(raw_name)
 
         if name not in VALID_CLASSES:
             continue
 
-        x1, y1, x2, y2 = tr.box
+        x1, y1, x2, y2 = tr.get_smoothed_box()
         color = get_class_color(name)
-        display_name = model.names.get(cls_id, str(cls_id))
-        if age < 0.8:
-            label = f"#{tr.track_id} {display_name} {tr.last_conf:.2f}"
+        display_name = raw_name.replace("_", " ").strip()
+        h_px = tr.height_info.get("box_height_px", max(1, y2 - y1))
+
+        if age < 1.0:
+            label = f"#{tr.track_id} {display_name} {tr.smooth_conf:.2f} H:{h_px}px"
         else:
-            label = f"#{tr.track_id} {display_name}"
+            label = f"#{tr.track_id} {display_name} H:{h_px}px"
+
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
         cv2.putText(
             frame,
             label,
             (x1, max(20, y1 - 10)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            0.65,
             color,
             2,
         )
@@ -602,7 +693,7 @@ def draw_tracks_and_summary(frame):
     for tr in snapshot:
         if (now - tr.last_seen) > MEMORY_TIME or not tr.confirmed():
             continue
-        name = model.names.get(tr.best_class(), "").strip().lower()
+        name = normalize_class_name(model.names.get(tr.best_class(), ""))
         if name not in VALID_CLASSES:
             continue
         counts[name] = counts.get(name, 0) + 1
@@ -612,7 +703,7 @@ def draw_tracks_and_summary(frame):
     bacterial = counts.get("bacterial leaf spot", 0)
     diseased_total = powdery + downy + bacterial
 
-    # 3. Draw summary bar with total diseases only, positioned at Y=80
+    # 3. Draw summary bar with total diseases, positioned at Y=80
     summary_text = f"total diseses : {diseased_total}"
 
     cv2.putText(
@@ -705,7 +796,7 @@ def analyze_image(frame):
 
     counts, confs = {}, []
     for det in dets:
-        name = model.names.get(int(det.cls[0]), "").strip().lower()
+        name = normalize_class_name(model.names.get(int(det.cls[0]), ""))
         if name not in VALID_CLASSES:
             continue
 
@@ -870,6 +961,7 @@ def cam_status():
         "online": is_camera_online(),
         "last_push_age_seconds": age,
         "total_frames_pushed": total_pushed,
+        "camera_height_cm": CAMERA_HEIGHT_CM,
     })
 
 
@@ -932,19 +1024,23 @@ def notifications_api():
 @app.route("/api/counts")
 @app.route("/counts")
 def counts_api():
+    now = time.time()
     with tracks_lock:
         snapshot = list(tracks)
 
     per_class = {}
+    heights = []
     for tr in snapshot:
-        if not tr.confirmed():
+        if (now - tr.last_seen) > MEMORY_TIME or not tr.confirmed():
             continue
-        name = model.names.get(tr.best_class(), "").strip().lower()
+        name = normalize_class_name(model.names.get(tr.best_class(), ""))
 
         if name not in VALID_CLASSES:
             continue
 
         per_class[name] = per_class.get(name, 0) + 1
+        if tr.height_info:
+            heights.append(tr.height_info)
 
     total = sum(per_class.values())
     healthy = per_class.get("healthy", 0)
@@ -952,10 +1048,12 @@ def counts_api():
 
     return jsonify({
         "camera_online": is_camera_online(),
+        "camera_height_cm": CAMERA_HEIGHT_CM,
         "per_class": per_class,
         "total_unique_plants": total,
         "healthy": healthy,
         "diseased": diseased,
+        "heights": heights,
     })
 
 
