@@ -1,6 +1,7 @@
+import atexit
+import signal
 import cv2
 import time
-import io
 import threading
 import os
 import json
@@ -39,6 +40,7 @@ if not SUPABASE_KEY:
 
 TABLE_LIVE = "live_sessions"
 TABLE_SCAN = "scheduled_scans"
+SNAPSHOT_BUCKET = "session_snapshots"
 
 supabase: Client = None
 if SUPABASE_KEY:
@@ -57,7 +59,8 @@ CHUNK_SIZE = 8192
 IOU_MATCH_THRESHOLD = 0.15
 MIN_FRAMES_TO_CONFIRM = 1
 
-SESSION_FLUSH_INTERVAL = 60  # seconds
+SESSION_FLUSH_INTERVAL = 60  # seconds (optional periodic flush if enabled)
+ENABLE_PERIODIC_FLUSH = os.environ.get("ENABLE_PERIODIC_FLUSH", "0") == "1"
 MIN_CONFIRMED_TO_SAVE = 1
 
 # ---------- Colors & Strict Whitelist ----------
@@ -79,7 +82,7 @@ def get_class_color(class_name: str):
 def is_exclusive_lettuce(frame, box, conf) -> bool:
     """
     Lettuce-Exclusive Validation Filter:
-    1. Enforces a relaxed confidence floor (0.40) to allow valid detections.
+    1. Enforces a confidence floor (0.40) to allow valid detections.
     2. Uses a broader HSV color space mask to verify plant foliage and
        accommodate dark greens, yellow-greens, and disease lesions.
     """
@@ -104,10 +107,7 @@ def is_exclusive_lettuce(frame, box, conf) -> bool:
         if crop.size == 0:
             return False
 
-        # Convert crop to HSV to evaluate foliage pigment
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-
-        # Expanded HSV range to include dark greens, yellows, and spots
         lower_foliage = np.array([5, 10, 10])
         upper_foliage = np.array([105, 255, 255])
 
@@ -116,14 +116,12 @@ def is_exclusive_lettuce(frame, box, conf) -> bool:
         total_pixels = box_width * box_height
 
         foliage_ratio = foliage_pixel_count / float(total_pixels)
-
-        # Requires at least 3% of the bounding box to match authentic plant tissue
         if foliage_ratio < 0.03:
             return False
 
         return True
     except Exception:
-        return True  # Fallback if coordinate math encounters an edge case
+        return True
 
 
 def health_label_for(diseased: int) -> str:
@@ -140,6 +138,7 @@ def health_label_for(diseased: int) -> str:
 # Shared state
 # ======================================================================
 latest_frame = None
+last_annotated_frame = None
 frame_lock = threading.Lock()
 frame_id = 0
 last_frame_push_time = 0.0
@@ -186,6 +185,7 @@ session_lock = threading.Lock()
 session_active = False
 session_saved = False
 session_start_time = None
+_shutting_down = False
 
 
 # ======================================================================
@@ -277,10 +277,9 @@ def tracker_update(detections, now):
 # Supabase save - Live Stream Session
 # ======================================================================
 def _build_session_row():
-    global session_start_time
-
     with tracks_lock:
         snapshot = list(tracks)
+        raw_track_count = len(snapshot)
 
     confirmed = []
     for tr in snapshot:
@@ -293,12 +292,14 @@ def _build_session_row():
         confirmed.append((tr, class_name))
 
     if len(confirmed) < MIN_CONFIRMED_TO_SAVE:
-        return None, 0
+        return None, len(confirmed), raw_track_count
 
     counts = {}
     confs = []
-    for tr, class_name in confirmed:
+    for _, class_name in confirmed:
         counts[class_name] = counts.get(class_name, 0) + 1
+
+    for tr, _ in confirmed:
         confs.append(tr.best_confidence())
 
     healthy = counts.get("healthy", 0)
@@ -307,7 +308,9 @@ def _build_session_row():
     bacterial = counts.get("bacterial leaf spot", 0)
     diseased = powdery + downy + bacterial
 
-    duration = int(time.time() - session_start_time) if session_start_time else 0
+    with session_lock:
+        start_ts = session_start_time
+    duration = int(time.time() - start_ts) if start_ts else 0
 
     row = {
         "overall_health": health_label_for(diseased),
@@ -320,29 +323,61 @@ def _build_session_row():
         "total_unique_plants": healthy + diseased,
         "session_duration_seconds": duration,
     }
-    return row, len(confirmed)
+    return row, len(confirmed), raw_track_count
 
 
-def save_session_to_supabase():
-    if supabase is None:
-        print("[Supabase] Not configured, cannot save session.")
-        return False
-
-    row, n_confirmed = _build_session_row()
-    if row is None:
-        print(f"[Session] Only {n_confirmed} confirmed plant(s) - skipping save.")
-        return False
-
+def _capture_annotated_snapshot():
+    """Returns a copy of the latest frame with bounding boxes & summary drawn."""
     snapshot_frame = None
     with frame_lock:
         if latest_frame is not None:
             snapshot_frame = latest_frame.copy()
+        elif last_annotated_frame is not None:
+            return last_annotated_frame.copy()
 
+    if snapshot_frame is None:
+        return None
+
+    draw_tracks_and_summary(snapshot_frame)
+    with frame_lock:
+        globals()["last_annotated_frame"] = snapshot_frame.copy()
+    return snapshot_frame
+
+
+def save_session_to_supabase(force: bool = False):
+    if supabase is None:
+        print("[Supabase] Not configured, cannot save session.")
+        return False
+
+    row, n_confirmed, raw_count = _build_session_row()
+    if row is None and not force:
+        print(
+            f"[Session] Skipping save: {n_confirmed} confirmed out of {raw_count} raw tracks."
+        )
+        return False
+
+    if row is None and force:
+        # Force save fallback when tracks are empty so explicit saves/exits can still record if needed
+        with session_lock:
+            start_ts = session_start_time
+        duration = int(time.time() - start_ts) if start_ts else 0
+        row = {
+            "overall_health": health_label_for(0),
+            "overall_confidence": 0.0,
+            "healthy_count": 0,
+            "powdery_mildew_count": 0,
+            "downy_mildew_count": 0,
+            "bacterial_leaf_spot_count": 0,
+            "total_diseases_detected": 0,
+            "total_unique_plants": 0,
+            "session_duration_seconds": duration,
+        }
+
+    snapshot_frame = _capture_annotated_snapshot()
     image_url = None
+
     if snapshot_frame is not None:
         try:
-            draw_tracks_and_summary(snapshot_frame)
-
             success, encoded_img = cv2.imencode(
                 ".jpg", snapshot_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
             )
@@ -350,49 +385,58 @@ def save_session_to_supabase():
                 file_bytes = encoded_img.tobytes()
                 file_name = f"session_{int(time.time())}.jpg"
 
-                supabase.storage.from_("session_snapshots").upload(
+                supabase.storage.from_(SNAPSHOT_BUCKET).upload(
                     path=file_name,
                     file=file_bytes,
                     file_options={"content-type": "image/jpeg"},
                 )
-
-                public_url_res = supabase.storage.from_(
-                    "session_snapshots"
-                ).get_public_url(file_name)
-                image_url = public_url_res
+                image_url = supabase.storage.from_(SNAPSHOT_BUCKET).get_public_url(
+                    file_name
+                )
                 print(f"[Supabase] Snapshot with bounding boxes uploaded: {image_url}")
         except Exception as e:
-            print(f"[Supabase] Image upload failed: {e}")
+            print(f"[Supabase] Image upload failed: {type(e).__name__}: {e}")
+    else:
+        print("[Supabase] No frame available for bounding box snapshot.")
 
     row["image_url"] = image_url
 
     try:
         supabase.table(TABLE_LIVE).insert(row).execute()
-        print(f"[Session] Saved to {TABLE_LIVE} with image and boxes.")
+        print(
+            f"[Session] Saved to {TABLE_LIVE}: plants={row['total_unique_plants']} "
+            f"diseases={row['total_diseases_detected']} image_url={bool(image_url)}"
+        )
         return True
     except Exception as e:
         print(f"[Supabase] Session insert failed: {type(e).__name__}: {e}")
         return False
 
 
+def _reset_session_tracks_locked():
+    global tracks, next_track_id, session_start_time
+    with tracks_lock:
+        tracks = []
+        next_track_id = 1
+    session_start_time = None
+
+
 # ======================================================================
-# Session lifecycle
+# Session lifecycle & exit handlers
 # ======================================================================
 def on_client_connected():
-    global session_active, session_saved, tracks, next_track_id, session_start_time
+    global session_active, session_saved, session_start_time
     with session_lock:
         if not session_active:
             session_active = True
             session_saved = False
             session_start_time = time.time()
-            with tracks_lock:
-                tracks = []
-                next_track_id = 1
+            _reset_session_tracks_locked()
             print("[Session] Started. Tracker cleared.")
 
 
 def on_client_disconnected(last_client: bool):
-    global session_active, session_saved, tracks, next_track_id, session_start_time
+    global session_active, session_saved
     if not last_client:
         return
 
@@ -402,30 +446,60 @@ def on_client_disconnected(last_client: bool):
         session_saved = True
         session_active = False
 
-    print("[Session] Stream ended. Saving session to Supabase...")
-    save_session_to_supabase()
-
-    with tracks_lock:
-        tracks = []
-        next_track_id = 1
-    session_start_time = None
+    print("[Session] Stream ended. Saving session with bounding boxes to Supabase...")
+    save_session_to_supabase(force=False)
+    with session_lock:
+        _reset_session_tracks_locked()
     print("[Session] Tracker reset. Ready for next session.")
 
 
+def flush_active_session_on_exit(reason: str = "exit"):
+    """Ensures any active or unsaved tracked detections are saved when app exits."""
+    global session_active, session_saved, _shutting_down
+    with session_lock:
+        if _shutting_down and session_saved:
+            return
+        _shutting_down = True
+        with tracks_lock:
+            has_tracks = len(tracks) > 0
+        if not session_active and not has_tracks:
+            return
+        session_active = False
+        session_saved = True
+
+    print(f"[Session] Application {reason} detected. Saving session to Supabase...")
+    save_session_to_supabase(force=False)
+    with session_lock:
+        _reset_session_tracks_locked()
+
+
+def _handle_signal(signum, _frame):
+    flush_active_session_on_exit(reason=f"signal {signum}")
+    raise SystemExit(0)
+
+
+atexit.register(flush_active_session_on_exit, "atexit")
+for _sig in (signal.SIGTERM, signal.SIGINT):
+    try:
+        signal.signal(_sig, _handle_signal)
+    except Exception:
+        pass
+
+
 def session_flush_thread():
-    global session_start_time, next_track_id
+    global session_start_time
     while True:
         time.sleep(SESSION_FLUSH_INTERVAL)
+        if not ENABLE_PERIODIC_FLUSH:
+            continue
         with session_lock:
             if not session_active:
                 continue
-            saved = save_session_to_supabase()
+            saved = save_session_to_supabase(force=False)
             if saved:
-                with tracks_lock:
-                    tracks.clear()
-                    next_track_id = 1
+                _reset_session_tracks_locked()
                 session_start_time = time.time()
-                print("[Session] Flush complete. Window restarted.")
+                print("[Session] Periodic flush complete. Window restarted.")
 
 
 # ======================================================================
@@ -560,7 +634,6 @@ def inference_thread():
 
                 conf = float(det.conf[0]) if det.conf is not None else 0.0
 
-                # --- EXCLUSIVE AUTOMATED LETTUCE CHECK ---
                 if not is_exclusive_lettuce(frame, box, conf):
                     continue
 
@@ -571,6 +644,12 @@ def inference_thread():
                 })
 
             tracker_update(clean, now)
+
+            if clean:
+                annotated = frame.copy()
+                draw_tracks_and_summary(annotated)
+                with frame_lock:
+                    globals()["last_annotated_frame"] = annotated
 
         except Exception as e:
             print(f"[Infer] {type(e).__name__}: {e}")
@@ -734,7 +813,6 @@ def analyze_image(frame):
 
         conf = float(det.conf[0]) if det.conf is not None else 0.0
 
-        # --- EXCLUSIVE AUTOMATED LETTUCE CHECK ---
         if not is_exclusive_lettuce(frame, box, conf):
             continue
 
@@ -1006,32 +1084,34 @@ def history():
 
 @app.route("/session/force_save", methods=["POST"])
 def force_save_session():
-    ok = save_session_to_supabase()
+    force = request.args.get("force", "0") == "1"
+    ok = save_session_to_supabase(force=force)
     return jsonify({"saved": ok})
 
 
-# Start background inference thread once when module loads
-_infer_thread_started = False
-_infer_thread_lock = threading.Lock()
+# Start background threads once when module loads
+_bg_threads_started = False
+_bg_threads_lock = threading.Lock()
 
 
-def ensure_inference_thread():
-    global _infer_thread_started
-    with _infer_thread_lock:
-        if not _infer_thread_started:
+def ensure_background_threads():
+    global _bg_threads_started
+    with _bg_threads_lock:
+        if not _bg_threads_started:
             threading.Thread(target=inference_thread, daemon=True).start()
-            _infer_thread_started = True
+            threading.Thread(target=session_flush_thread, daemon=True).start()
+            _bg_threads_started = True
 
 
-ensure_inference_thread()
+ensure_background_threads()
 
 # ======================================================================
 # Main
 # ======================================================================
 if __name__ == "__main__":
-    ensure_inference_thread()
+    ensure_background_threads()
     if ENABLE_LAN_READER:
         threading.Thread(target=reader_thread, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
-    print(f"[Main] Inference thread started. Serving on http://0.0.0.0:{port}")
+    print(f"[Main] Background threads started. Serving on http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
