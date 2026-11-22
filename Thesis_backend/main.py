@@ -44,12 +44,14 @@ if SUPABASE_KEY:
         print(f"[Supabase] Init failed: {e}")
 
 # ---------- Tuning & Automated Lettuce-Exclusive Filtering ----------
-# Tuned for shared CPU on Railway to reduce 499s and HTTP -11 read timeouts
-INFER_INTERVAL = float(os.environ.get("INFER_INTERVAL", "0.5"))
-INFER_IMGSZ = int(os.environ.get("INFER_IMGSZ", "512"))
-CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.25"))
+# Tuned for higher/farther camera mounting while protecting Railway CPU against 499s
+INFER_INTERVAL = float(os.environ.get("INFER_INTERVAL", "0.8"))
+INFER_IMGSZ = int(os.environ.get("INFER_IMGSZ", "640"))
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.18"))
 MIN_FOLIAGE_RATIO = float(os.environ.get("MIN_FOLIAGE_RATIO", "0.01"))
 MIN_BOX_PX = int(os.environ.get("MIN_BOX_PX", "6"))
+# Optional center zoom margin (0.0 = full frame, 0.25 = crops inner 50% width & height)
+FAR_ZOOM_MARGIN = float(os.environ.get("FAR_ZOOM_MARGIN", "0.0"))
 DEBUG_DETECTIONS = os.environ.get("DEBUG_DETECTIONS", "1") == "1"
 
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "75"))
@@ -74,6 +76,31 @@ VALID_CLASSES = {name.lower() for name in COLOR_MAP.keys()}
 
 def get_class_color(class_name: str):
     return COLOR_MAP.get(class_name.strip().lower(), DEFAULT_COLOR)
+
+
+def prepare_inference_view(frame):
+    """
+    Applies optional center zoom crop for distant/high camera mounting and
+    returns (view_frame, offset_x, offset_y) so boxes map back to original frame coordinates.
+    """
+    margin = max(0.0, min(0.4, FAR_ZOOM_MARGIN))
+    if margin <= 0.0:
+        return frame, 0, 0
+
+    h, w, _ = frame.shape
+    x1 = int(w * margin)
+    y1 = int(h * margin)
+    x2 = int(w * (1.0 - margin))
+    y2 = int(h * (1.0 - margin))
+
+    if (x2 - x1) < 32 or (y2 - y1) < 32:
+        return frame, 0, 0
+
+    cropped = frame[y1:y2, x1:x2]
+    if cropped.size == 0:
+        return frame, 0, 0
+
+    return cropped, x1, y1
 
 
 def check_lettuce_box(frame, box, conf):
@@ -431,19 +458,19 @@ def session_flush_thread():
 # ======================================================================
 # Inference thread
 # ======================================================================
-def extract_box(det):
+def extract_box(det, offset_x=0, offset_y=0):
     try:
         if hasattr(det, "xyxyxyxy") and det.xyxyxyxy is not None:
             pts = det.xyxyxyxy[0].cpu().numpy()
             return (
-                int(np.min(pts[:, 0])),
-                int(np.min(pts[:, 1])),
-                int(np.max(pts[:, 0])),
-                int(np.max(pts[:, 1])),
+                int(np.min(pts[:, 0])) + offset_x,
+                int(np.min(pts[:, 1])) + offset_y,
+                int(np.max(pts[:, 0])) + offset_x,
+                int(np.max(pts[:, 1])) + offset_y,
             )
         if hasattr(det, "xyxy") and det.xyxy is not None:
             x1, y1, x2, y2 = map(int, det.xyxy[0])
-            return (x1, y1, x2, y2)
+            return (x1 + offset_x, y1 + offset_y, x2 + offset_x, y2 + offset_y)
     except Exception:
         pass
     return None
@@ -473,9 +500,13 @@ def inference_thread():
         last_infer = now
 
         try:
+            infer_view, ox, oy = prepare_inference_view(frame)
             with model_lock:
                 results = model.predict(
-                    source=frame, conf=CONF_THRESHOLD, imgsz=INFER_IMGSZ, verbose=False
+                    source=infer_view,
+                    conf=CONF_THRESHOLD,
+                    imgsz=INFER_IMGSZ,
+                    verbose=False,
                 )
             r0 = results[0]
 
@@ -498,7 +529,7 @@ def inference_thread():
                     rejected_reasons.append(f"{raw_name}({conf:.2f}):invalid_class")
                     continue
 
-                box = extract_box(det)
+                box = extract_box(det, ox, oy)
                 if box is None:
                     rejected_reasons.append(f"{raw_name}({conf:.2f}):no_box")
                     continue
@@ -658,9 +689,10 @@ def generate_frames():
 # Scheduled-scan analysis (For Notifications / Periodic Scans)
 # ======================================================================
 def analyze_image(frame):
+    infer_view, ox, oy = prepare_inference_view(frame)
     with model_lock:
         results = model.predict(
-            source=frame, conf=CONF_THRESHOLD, imgsz=INFER_IMGSZ, verbose=False
+            source=infer_view, conf=CONF_THRESHOLD, imgsz=INFER_IMGSZ, verbose=False
         )
     r0 = results[0]
 
@@ -677,7 +709,7 @@ def analyze_image(frame):
         if name not in VALID_CLASSES:
             continue
 
-        box = extract_box(det)
+        box = extract_box(det, ox, oy)
         if box is None:
             continue
 
