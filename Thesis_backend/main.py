@@ -34,7 +34,7 @@ SUPABASE_URL = os.environ.get(
     "SUPABASE_URL", "https://jodqigqgnxiakhcdnzlw.supabase.co"
 )
 SUPABASE_KEY = os.environ.get(
-    "SUPABASE_KEY", "sb_secret_HIG1tB6lKdNsZ9BN0892aA_m_r0kQHU"
+    "SUPABASE_KEY", "sb_publishable_aBUBA9pGcHeCqoY7roQOeQ_x75IS62V"
 )
 if not SUPABASE_KEY:
     print("[Supabase] WARNING: SUPABASE_KEY not set - detections will NOT be saved.")
