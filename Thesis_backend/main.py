@@ -45,8 +45,13 @@ if SUPABASE_KEY:
 
 # ---------- Tuning & Automated Lettuce-Exclusive Filtering ----------
 # Tuned for shared CPU on Railway to reduce 499s and HTTP -11 read timeouts
-INFER_INTERVAL = float(os.environ.get("INFER_INTERVAL", "0.6"))
-INFER_IMGSZ = int(os.environ.get("INFER_IMGSZ", "416"))
+INFER_INTERVAL = float(os.environ.get("INFER_INTERVAL", "0.5"))
+INFER_IMGSZ = int(os.environ.get("INFER_IMGSZ", "512"))
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.25"))
+MIN_FOLIAGE_RATIO = float(os.environ.get("MIN_FOLIAGE_RATIO", "0.01"))
+MIN_BOX_PX = int(os.environ.get("MIN_BOX_PX", "6"))
+DEBUG_DETECTIONS = os.environ.get("DEBUG_DETECTIONS", "1") == "1"
+
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "75"))
 MEMORY_TIME = 15.0
 IOU_MATCH_THRESHOLD = 0.15
@@ -71,15 +76,13 @@ def get_class_color(class_name: str):
     return COLOR_MAP.get(class_name.strip().lower(), DEFAULT_COLOR)
 
 
-def is_exclusive_lettuce(frame, box, conf) -> bool:
+def check_lettuce_box(frame, box, conf):
     """
-    Lettuce-Exclusive Validation Filter:
-    1. Enforces a relaxed confidence floor (0.40) to allow valid detections.
-    2. Uses a broader HSV color space mask to verify plant foliage and
-       accommodate dark greens, yellow-greens, and disease lesions.
+    Validates box dimensions, confidence, and broad foliage HSV range.
+    Returns (True, "ok") or (False, reason).
     """
-    if conf < 0.40:
-        return False
+    if conf < CONF_THRESHOLD:
+        return False, f"low_conf({conf:.2f}<{CONF_THRESHOLD:.2f})"
 
     try:
         x1, y1, x2, y2 = box
@@ -92,30 +95,35 @@ def is_exclusive_lettuce(frame, box, conf) -> bool:
         box_width = x2 - x1
         box_height = y2 - y1
 
-        if box_width <= 10 or box_height <= 10:
-            return False
+        if box_width <= MIN_BOX_PX or box_height <= MIN_BOX_PX:
+            return False, f"small_box({box_width}x{box_height})"
 
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
-            return False
+            return False, "empty_crop"
 
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
 
-        lower_foliage = np.array([5, 10, 10])
-        upper_foliage = np.array([105, 255, 255])
+        # Broad green / yellow-green / pale / dark-spot plant range
+        lower_foliage = np.array([5, 8, 8])
+        upper_foliage = np.array([110, 255, 255])
 
         mask = cv2.inRange(hsv, lower_foliage, upper_foliage)
         foliage_pixel_count = cv2.countNonZero(mask)
-        total_pixels = box_width * box_height
+        total_pixels = float(box_width * box_height)
+        foliage_ratio = foliage_pixel_count / total_pixels
 
-        foliage_ratio = foliage_pixel_count / float(total_pixels)
+        if foliage_ratio < MIN_FOLIAGE_RATIO:
+            return False, f"low_foliage({foliage_ratio:.3f}<{MIN_FOLIAGE_RATIO:.3f})"
 
-        if foliage_ratio < 0.03:
-            return False
+        return True, "ok"
+    except Exception as e:
+        return True, f"fallback({e})"
 
-        return True
-    except Exception:
-        return True
+
+def is_exclusive_lettuce(frame, box, conf) -> bool:
+    ok, _ = check_lettuce_box(frame, box, conf)
+    return ok
 
 
 def health_label_for(diseased: int) -> str:
@@ -467,7 +475,7 @@ def inference_thread():
         try:
             with model_lock:
                 results = model.predict(
-                    source=frame, conf=0.40, imgsz=INFER_IMGSZ, verbose=False
+                    source=frame, conf=CONF_THRESHOLD, imgsz=INFER_IMGSZ, verbose=False
                 )
             r0 = results[0]
 
@@ -479,20 +487,25 @@ def inference_thread():
                 dets = []
 
             clean = []
+            rejected_reasons = []
             for det in dets:
                 cls_id = int(det.cls[0])
-                cls_name = model.names.get(cls_id, "").strip().lower()
+                raw_name = model.names.get(cls_id, f"class_{cls_id}")
+                cls_name = raw_name.strip().lower()
+                conf = float(det.conf[0]) if det.conf is not None else 0.0
 
                 if cls_name not in VALID_CLASSES:
+                    rejected_reasons.append(f"{raw_name}({conf:.2f}):invalid_class")
                     continue
 
                 box = extract_box(det)
                 if box is None:
+                    rejected_reasons.append(f"{raw_name}({conf:.2f}):no_box")
                     continue
 
-                conf = float(det.conf[0]) if det.conf is not None else 0.0
-
-                if not is_exclusive_lettuce(frame, box, conf):
+                ok, reason = check_lettuce_box(frame, box, conf)
+                if not ok:
+                    rejected_reasons.append(f"{raw_name}({conf:.2f}):{reason}")
                     continue
 
                 clean.append({
@@ -500,6 +513,15 @@ def inference_thread():
                     "conf": conf,
                     "box": box,
                 })
+
+            if DEBUG_DETECTIONS and fid % 10 == 1:
+                kept_summary = [
+                    f"{model.names.get(d['cls_id'], d['cls_id'])}({d['conf']:.2f})"
+                    for d in clean
+                ]
+                print(
+                    f"[Infer fid={fid}] kept={kept_summary} rejected={rejected_reasons}"
+                )
 
             tracker_update(clean, now)
 
@@ -515,7 +537,7 @@ def draw_tracks_and_summary(frame):
     with tracks_lock:
         snapshot = list(tracks)
 
-    # 1. Draw bounding boxes
+    # 1. Draw bounding boxes for active confirmed tracks
     for tr in snapshot:
         age = now - tr.last_seen
         if age > MEMORY_TIME:
@@ -526,16 +548,13 @@ def draw_tracks_and_summary(frame):
         if name not in VALID_CLASSES:
             continue
 
-        if not is_exclusive_lettuce(frame, tr.box, tr.best_confidence()):
-            continue
-
         x1, y1, x2, y2 = tr.box
         color = get_class_color(name)
         display_name = model.names.get(cls_id, str(cls_id))
-        if age < 0.5:
+        if age < 0.8:
             label = f"#{tr.track_id} {display_name} {tr.last_conf:.2f}"
         else:
-            label = f"#{tr.track_id} {display_name} "
+            label = f"#{tr.track_id} {display_name}"
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
         cv2.putText(
             frame,
@@ -547,15 +566,13 @@ def draw_tracks_and_summary(frame):
             2,
         )
 
-    # 2. Compute counts for the summary banner
+    # 2. Compute counts for the summary banner from active confirmed tracks
     counts = {}
     for tr in snapshot:
-        if not tr.confirmed():
+        if (now - tr.last_seen) > MEMORY_TIME or not tr.confirmed():
             continue
         name = model.names.get(tr.best_class(), "").strip().lower()
         if name not in VALID_CLASSES:
-            continue
-        if not is_exclusive_lettuce(frame, tr.box, tr.best_confidence()):
             continue
         counts[name] = counts.get(name, 0) + 1
 
@@ -643,7 +660,7 @@ def generate_frames():
 def analyze_image(frame):
     with model_lock:
         results = model.predict(
-            source=frame, conf=0.40, imgsz=INFER_IMGSZ, verbose=False
+            source=frame, conf=CONF_THRESHOLD, imgsz=INFER_IMGSZ, verbose=False
         )
     r0 = results[0]
 
@@ -941,12 +958,26 @@ def force_save_session():
     return jsonify({"saved": ok})
 
 
+# Start background inference thread once when module loads
+_infer_thread_started = False
+_infer_thread_lock = threading.Lock()
+
+
+def ensure_inference_thread():
+    global _infer_thread_started
+    with _infer_thread_lock:
+        if not _infer_thread_started:
+            threading.Thread(target=inference_thread, daemon=True).start()
+            _infer_thread_started = True
+
+
+ensure_inference_thread()
+
 # ======================================================================
 # Main
 # ======================================================================
 if __name__ == "__main__":
-    threading.Thread(target=inference_thread, daemon=True).start()
-    # threading.Thread(target=session_flush_thread, daemon=True).start()
+    ensure_inference_thread()
     port = int(os.environ.get("PORT", 5000))
     print(f"[Main] Inference thread started. Serving on http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
