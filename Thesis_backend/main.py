@@ -30,10 +30,10 @@ CAM_ONLINE_TIMEOUT = 10.0  # seconds without a pushed frame before marking camer
 
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get(
-    "SUPABASE_URL", "https://jodqigqgnxiakhcdnzlw.supabase.co"
+    "SUPABASE_URL", "https://isslbortjspiazoslkdu.supabase.co"
 )
 SUPABASE_KEY = os.environ.get(
-    "SUPABASE_KEY", "sb_secret_-n1Bn_1U-evzc9Ir9DXaSw_QLhPOuee"
+    "SUPABASE_KEY", "sb_publishable_gmNf9QQAu3kEtyLf9EEv3w_lx0kxYRH"
 )
 if not SUPABASE_KEY:
     print("[Supabase] WARNING: SUPABASE_KEY not set - detections will NOT be saved.")
