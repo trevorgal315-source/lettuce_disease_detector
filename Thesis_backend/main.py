@@ -24,7 +24,6 @@ ESP32_CAM_URL = os.environ.get("ESP32_CAM_URL", "http://192.168.1.119:81/stream"
 ENABLE_LAN_READER = os.environ.get("ENABLE_LAN_READER", "0") == "1"
 
 # Optional shared secret so random internet traffic cannot spoof ESP32 frames.
-# Set CAM_PUSH_TOKEN in both ESP32 code and Railway env vars if desired.
 CAM_PUSH_TOKEN = os.environ.get("CAM_PUSH_TOKEN", "")
 CAM_ONLINE_TIMEOUT = 10.0  # seconds without a pushed frame before marking camera offline
 CLIENT_IDLE_TIMEOUT = 12.0  # seconds without yielding a frame before ending client
@@ -61,9 +60,12 @@ IOU_MATCH_THRESHOLD = 0.15
 MIN_FRAMES_TO_CONFIRM = 1
 CONF_THRESHOLD = 0.25
 
-SESSION_FLUSH_INTERVAL = 60  # seconds (optional periodic flush if enabled)
+SESSION_FLUSH_INTERVAL = 60
 ENABLE_PERIODIC_FLUSH = os.environ.get("ENABLE_PERIODIC_FLUSH", "0") == "1"
 MIN_CONFIRMED_TO_SAVE = 1
+
+# Save even when 0 confirmed tracks exist (e.g., healthy/empty exit snapshot)
+SAVE_ON_EXIT_FORCE = os.environ.get("SAVE_ON_EXIT_FORCE", "1") == "1"
 
 # ---------- Colors & Strict Whitelist ----------
 COLOR_MAP = {
@@ -181,12 +183,12 @@ def is_camera_online() -> bool:
 
 
 # ======================================================================
-# Session state
+# Session state (Continuous from startup; saves on stream exit or app exit)
 # ======================================================================
 session_lock = threading.Lock()
-session_active = False
+session_active = True
 session_saved = False
-session_start_time = None
+session_start_time = time.time()
 _shutting_down = False
 
 
@@ -413,64 +415,67 @@ def save_session_to_supabase(force: bool = False):
         return False
 
 
-def _reset_session_tracks_locked():
-    global tracks, next_track_id, session_start_time
+def _reset_session_tracks_locked(restart_monitoring: bool = True):
+    global tracks, next_track_id, session_active, session_saved, session_start_time
     with tracks_lock:
         tracks = []
         next_track_id = 1
-    session_start_time = None
+    if restart_monitoring:
+        session_active = True
+        session_saved = False
+        session_start_time = time.time()
+    else:
+        session_active = False
+        session_start_time = None
 
 
 # ======================================================================
 # Session lifecycle & exit handlers
 # ======================================================================
 def on_client_connected():
-    global session_active, session_saved, session_start_time
+    """Viewer joined /video_feed; continuous background monitoring is already active."""
+    global session_active, session_start_time
     with session_lock:
         if not session_active:
             session_active = True
-            session_saved = False
-            session_start_time = time.time()
-            _reset_session_tracks_locked()
-            print("[Session] Started. Tracker cleared.")
+            if session_start_time is None:
+                session_start_time = time.time()
+    print("[Stream] Viewer attached to continuous monitoring.")
 
 
 def on_client_disconnected(last_client: bool):
-    global session_active, session_saved
+    """Saves session when last /video_feed client leaves, then resumes continuous monitoring."""
+    global session_saved
     if not last_client:
         return
 
     with session_lock:
-        if not session_active or session_saved:
+        if session_saved:
             return
         session_saved = True
-        session_active = False
 
-    print("[Session] Stream ended. Saving session with bounding boxes to Supabase...")
-    save_session_to_supabase(force=False)
+    print("[Session] Last livestream client exited. Saving session to Supabase...")
+    save_session_to_supabase(force=SAVE_ON_EXIT_FORCE)
     with session_lock:
-        _reset_session_tracks_locked()
-    print("[Session] Tracker reset. Ready for next session.")
+        _reset_session_tracks_locked(restart_monitoring=True)
+    print("[Session] Tracker reset. Continuous monitoring resumed.")
 
 
 def flush_active_session_on_exit(reason: str = "exit"):
-    """Ensures any active or unsaved tracked detections are saved when app exits."""
-    global session_active, session_saved, _shutting_down
+    """Ensures session data and snapshot are saved when the Flask app exits."""
+    global session_saved, _shutting_down
     with session_lock:
         if _shutting_down and session_saved:
             return
         _shutting_down = True
-        with tracks_lock:
-            has_tracks = len(tracks) > 0
-        if not session_active and not has_tracks:
+        if session_saved:
             return
-        session_active = False
         session_saved = True
 
     print(f"[Session] Application {reason} detected. Saving session to Supabase...")
-    save_session_to_supabase(force=False)
+    save_session_to_supabase(force=SAVE_ON_EXIT_FORCE)
     with session_lock:
-        _reset_session_tracks_locked()
+        _reset_session_tracks_locked(restart_monitoring=False)
 
 
 def _handle_signal(signum, _frame):
@@ -497,8 +502,7 @@ def session_flush_thread():
                 continue
             saved = save_session_to_supabase(force=False)
             if saved:
-                _reset_session_tracks_locked()
-                session_start_time = time.time()
+                _reset_session_tracks_locked(restart_monitoring=True)
                 print("[Session] Periodic flush complete. Window restarted.")
 
 
@@ -601,6 +605,12 @@ def inference_thread():
 
         if frame is None or fid == last_seen_frame:
             time.sleep(0.02)
+            continue
+
+        with session_lock:
+            active = session_active and not _shutting_down
+        if not active:
+            time.sleep(0.05)
             continue
 
         last_seen_frame = fid
@@ -1020,116 +1030,24 @@ def upload():
 
         row = save_scan_to_supabase(counts, avg_conf)
         push_notification(row)
-        print(f"[Upload] Scan done: {counts} avg_conf={avg_conf:.3f}")
-        return jsonify({"ok": True, "result": row})
+        return jsonify({"ok": True, "scan": row})
     except Exception as e:
-        print(f"[Upload] {type(e).__name__}: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f"[Upload Error] {type(e).__name__}: {e}")
+        return jsonify({"error": "Failed to process image"}), 500
 
-
-@app.route("/api/notifications")
-@app.route("/notifications")
-def notifications_api():
-    try:
-        since = int(request.args.get("since", -1))
-    except ValueError:
-        since = -1
-
-    with notif_lock:
-        latest = notif_counter
-        if since < 0:
-            items = [notifications[-1]] if notifications else []
-        else:
-            items = [n for n in notifications if n["id"] > since]
-
-    return jsonify({"latest_id": latest, "items": items})
-
-
-@app.route("/api/counts")
-@app.route("/counts")
-def counts_api():
-    with tracks_lock:
-        snapshot = list(tracks)
-
-    per_class = {}
-    for tr in snapshot:
-        if not tr.confirmed():
-            continue
-        name = model.names.get(tr.best_class(), "").strip().lower()
-
-        if name not in VALID_CLASSES:
-            continue
-
-        per_class[name] = per_class.get(name, 0) + 1
-
-    total = sum(per_class.values())
-    healthy = per_class.get("healthy", 0)
-    diseased = total - healthy
-
-    return jsonify({
-        "camera_online": is_camera_online(),
-        "per_class": per_class,
-        "total_unique_plants": total,
-        "healthy": healthy,
-        "diseased": diseased,
-    })
-
-
-@app.route("/api/history")
-@app.route("/history")
-def history():
-    if supabase is None:
-        return jsonify({"error": "supabase not configured"})
-
-    source = request.args.get("source", "live").lower()
-    table = {"live": TABLE_LIVE, "scan": TABLE_SCAN}.get(source)
-    if table is None:
-        return jsonify({"error": "source must be 'live' or 'scan'"}), 400
-
-    try:
-        limit = int(request.args.get("limit", 50))
-        res = (
-            supabase.table(table)
-            .select("*")
-            .order("created_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
-        return jsonify({"source": source, "records": res.data or []})
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
-
-@app.route("/session/force_save", methods=["POST"])
-def force_save_session():
-    force = request.args.get("force", "0") == "1"
-    ok = save_session_to_supabase(force=force)
-    return jsonify({"saved": ok})
-
-
-# Start background threads once when module loads
-_bg_threads_started = False
-_bg_threads_lock = threading.Lock()
-
-
-def ensure_background_threads():
-    global _bg_threads_started
-    with _bg_threads_lock:
-        if not _bg_threads_started:
-            threading.Thread(target=inference_thread, daemon=True).start()
-            threading.Thread(target=session_flush_thread, daemon=True).start()
-            _bg_threads_started = True
-
-
-ensure_background_threads()
 
 # ======================================================================
-# Main
+# Background threads & server startup
 # ======================================================================
-if __name__ == "__main__":
-    ensure_background_threads()
+def _start_background_threads():
+    threading.Thread(target=inference_thread, daemon=True).start()
+    threading.Thread(target=session_flush_thread, daemon=True).start()
     if ENABLE_LAN_READER:
         threading.Thread(target=reader_thread, daemon=True).start()
+
+
+_start_background_threads()
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"[Main] Background threads started. Serving on http://0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=port, threaded=True)
