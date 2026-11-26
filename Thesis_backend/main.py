@@ -17,7 +17,8 @@ from supabase import create_client, Client
 # Setup
 # ======================================================================
 app = Flask(__name__)
-model = YOLO("best.pt")
+MODEL_PATH = os.environ.get("MODEL_PATH", "best.pt")  # e.g. best.onnx for faster CPU
+model = YOLO(MODEL_PATH)
 print(f"This model can detect: {model.names}")
 
 ESP32_CAM_URL = os.environ.get("ESP32_CAM_URL", "http://192.168.1.119:81/stream")
@@ -56,9 +57,9 @@ if SUPABASE_KEY:
         print(f"[Supabase] Init failed: {e}")
 
 # ---------- Tuning & Automated Lettuce-Exclusive Filtering ----------
-INFER_INTERVAL = float(os.environ.get("INFER_INTERVAL", "0.10"))
-INFER_IMGSZ = int(os.environ.get("INFER_IMGSZ", "640"))  # try 480 on slow servers
-JPEG_QUALITY = 80
+INFER_INTERVAL = float(os.environ.get("INFER_INTERVAL", "0.0"))  # 0 = run as fast as the model allows
+INFER_IMGSZ = int(os.environ.get("INFER_IMGSZ", "480"))  # 416/320 = faster, 640 = more detail
+JPEG_QUALITY = 75
 MEMORY_TIME = 15.0
 CHUNK_SIZE = 8192
 IOU_MATCH_THRESHOLD = 0.15
@@ -70,14 +71,23 @@ ENABLE_PERIODIC_FLUSH = os.environ.get("ENABLE_PERIODIC_FLUSH", "0") == "1"
 MIN_CONFIRMED_TO_SAVE = 1
 
 # ---------- Box smoothing / display tuning ----------
-SMOOTH_DURATION = 0.18   # seconds a box takes to glide to its newest position
-BOX_EMA_ALPHA = 0.6      # 0..1, higher = follows new detections faster, lower = steadier
+SMOOTH_DURATION = 0.12   # seconds a box takes to glide to its newest position
+BOX_EMA_ALPHA = 0.8      # 0..1, higher = follows new detections faster, lower = steadier
 CONF_EMA_ALPHA = 0.3     # smoothing for the confidence number in the label
-FADE_IN_SECONDS = 0.25   # new boxes fade in instead of popping
+FADE_IN_SECONDS = 0.12   # new boxes fade in instead of popping
 FADE_OUT_SECONDS = 2.0   # boxes fade out over the last seconds of MEMORY_TIME
 STALE_AFTER = 1.0        # seconds without a fresh detection -> thinner "remembered" box
 DEDUPE_IOU = 0.70        # overlapping detections above this are merged (keeps best conf)
 ANNOTATED_SNAPSHOT_EVERY = 2.0  # seconds between cached annotated frames
+
+# ---------- Latency compensation (motion prediction) ----------
+# Boxes come from a frame that is a few hundred ms old. We estimate each box's
+# velocity and project it forward to "now", so boxes sit on the plant in the
+# LIVE video and keep moving smoothly between detections.
+MAX_EXTRAPOLATE = 0.50   # max seconds to project ahead
+VEL_EMA_ALPHA = 0.5      # smoothing of the velocity estimate
+VEL_DEADZONE = 20.0      # px/s below this is treated as "not moving" (kills jitter drift)
+VEL_MAX = 500.0          # px/s sanity cap
 
 # ---------- Colors & Strict Whitelist ----------
 COLOR_MAP = {
@@ -154,6 +164,7 @@ def health_label_for(diseased: int) -> str:
 # Shared state
 # ======================================================================
 latest_frame = None
+latest_frame_ts = 0.0  # when the newest frame arrived (capture time)
 last_annotated_frame = None
 frame_lock = threading.Lock()
 frame_id = 0
@@ -215,7 +226,7 @@ class Track:
         "first_seen", "smooth_conf", "anim",
     )
 
-    def __init__(self, track_id, cls_id, conf, box, now):
+    def __init__(self, track_id, cls_id, conf, box, now, frame_ts):
         self.track_id = track_id
         self.cls_votes = {cls_id: {"count": 1, "conf_sum": float(conf)}}
         self.box = box  # raw last detection (used for matching)
@@ -224,27 +235,61 @@ class Track:
         self.first_seen = now
         self.smooth_conf = float(conf)
         fb = tuple(float(v) for v in box)
-        # anim = (start_box, target_box, start_time). Display position is a pure
-        # function of time, so every viewer / snapshot sees the same smooth box.
-        self.anim = (fb, fb, now)
+        # anim = (start_box, target_box, start_time, velocity(px/s), frame_ts)
+        # Display position is a pure function of time, so every viewer and every
+        # saved snapshot sees the same smooth box.
+        self.anim = (fb, fb, now, (0.0, 0.0), frame_ts)
+
+    @staticmethod
+    def _offset(vel, now, frame_ts):
+        """How far the plant has probably moved since the detection frame."""
+        dt = now - frame_ts
+        dt = 0.0 if dt < 0.0 else MAX_EXTRAPOLATE if dt > MAX_EXTRAPOLATE else dt
+        dx, dy = vel[0] * dt, vel[1] * dt
+        return (dx, dy, dx, dy)
 
     def current_box(self, now):
-        """Smoothly interpolated box for drawing at time `now`."""
-        prev, target, t0 = self.anim
+        """Smoothly interpolated + motion-compensated box for drawing at `now`."""
+        prev, target, t0, vel, fts = self.anim
         t = (now - t0) / SMOOTH_DURATION
         t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
         t = t * t * (3.0 - 2.0 * t)  # smoothstep easing
-        return tuple(int(round(p + (q - p) * t)) for p, q in zip(prev, target))
+        off = self._offset(vel, now, fts)
+        return tuple(
+            int(round(p + (q - p) * t + o)) for p, q, o in zip(prev, target, off)
+        )
 
-    def update(self, cls_id, conf, box, now):
+    def update(self, cls_id, conf, box, now, frame_ts):
         shown = self.current_box(now)  # where the box is drawn right now
-        old_target = self.anim[1]
+        _, old_target, _, old_vel, old_fts = self.anim
+
+        # --- velocity estimate from consecutive raw detections ---
+        vel = old_vel
+        dt = frame_ts - old_fts
+        if 0.02 < dt < 1.0:
+            ocx = (self.box[0] + self.box[2]) / 2.0
+            ocy = (self.box[1] + self.box[3]) / 2.0
+            ncx = (box[0] + box[2]) / 2.0
+            ncy = (box[1] + box[3]) / 2.0
+            vx = max(-VEL_MAX, min(VEL_MAX, (ncx - ocx) / dt))
+            vy = max(-VEL_MAX, min(VEL_MAX, (ncy - ocy) / dt))
+            vx = (1.0 - VEL_EMA_ALPHA) * old_vel[0] + VEL_EMA_ALPHA * vx
+            vy = (1.0 - VEL_EMA_ALPHA) * old_vel[1] + VEL_EMA_ALPHA * vy
+            if (vx * vx + vy * vy) ** 0.5 < VEL_DEADZONE:
+                vx = vy = 0.0
+            vel = (vx, vy)
+        elif dt >= 1.0:
+            vel = (0.0, 0.0)  # track was lost for a while: don't extrapolate
+
         new_target = tuple(
             BOX_EMA_ALPHA * float(r) + (1.0 - BOX_EMA_ALPHA) * o
             for r, o in zip(box, old_target)
         )
-        # start gliding from the currently drawn position -> no visual jumps
-        self.anim = (tuple(float(v) for v in shown), new_target, now)
+        # Start gliding from the position currently on screen (minus the new
+        # offset that gets added back on top) -> no visual jumps.
+        off_new = self._offset(vel, now, frame_ts)
+        start = tuple(float(s) - o for s, o in zip(shown, off_new))
+        self.anim = (start, new_target, now, vel, frame_ts)
 
         self.box = box
         self.last_seen = now
@@ -305,10 +350,12 @@ def dedupe_detections(dets):
     return kept
 
 
-def tracker_update(detections, now):
+def tracker_update(detections, now, frame_ts=None):
     """Global best-first matching: the strongest overlaps are paired first, so
     boxes keep the same ID/identity instead of swapping between neighbours."""
     global next_track_id
+    if frame_ts is None:
+        frame_ts = now
     with tracks_lock:
         pairs = []
         for di, det in enumerate(detections):
@@ -323,7 +370,7 @@ def tracker_update(detections, now):
             if di in used_d or ti in used_t:
                 continue
             det = detections[di]
-            tracks[ti].update(det["cls_id"], det["conf"], det["box"], now)
+            tracks[ti].update(det["cls_id"], det["conf"], det["box"], now, frame_ts)
             used_d.add(di)
             used_t.add(ti)
 
@@ -331,7 +378,7 @@ def tracker_update(detections, now):
             if di in used_d:
                 continue
             tracks.append(
-                Track(next_track_id, det["cls_id"], det["conf"], det["box"], now)
+                Track(next_track_id, det["cls_id"], det["conf"], det["box"], now, frame_ts)
             )
             next_track_id += 1
 
@@ -624,7 +671,7 @@ def session_flush_thread():
 # Reader thread (Optional LAN stream reader; use /push_frame over internet)
 # ======================================================================
 def reader_thread():
-    global latest_frame, frame_id, last_frame_push_time
+    global latest_frame, frame_id, last_frame_push_time, latest_frame_ts
     session = requests.Session()
     backoff = 1
 
@@ -673,6 +720,7 @@ def reader_thread():
                             latest_frame = frame
                             frame_id += 1
                             last_frame_push_time = time.time()
+                            latest_frame_ts = last_frame_push_time
 
         except Exception as e:
             print(f"[Reader] Connection dropped: {e}. Reconnecting in {backoff}s...")
@@ -713,13 +761,15 @@ def inference_thread():
 
         frame = None
         fid = -1
+        frame_ts = 0.0
         with frame_lock:
             if latest_frame is not None:
                 fid = frame_id
-                frame = latest_frame.copy()
+                frame = latest_frame  # no copy needed: inference never modifies it
+                frame_ts = latest_frame_ts
 
         if frame is None or fid == last_seen_frame:
-            time.sleep(0.02)
+            time.sleep(0.005)
             continue
 
         last_seen_frame = fid
@@ -728,7 +778,12 @@ def inference_thread():
         try:
             with model_lock:
                 results = model.predict(
-                    source=frame, conf=CONF_THRESHOLD, imgsz=INFER_IMGSZ, verbose=False
+                    source=frame,
+                    conf=CONF_THRESHOLD,
+                    imgsz=INFER_IMGSZ,
+                    verbose=False,
+                    agnostic_nms=True,  # one box per plant even if classes disagree
+                    max_det=30,
                 )
             r0 = results[0]
 
@@ -764,7 +819,7 @@ def inference_thread():
                 })
 
             clean = dedupe_detections(clean)
-            tracker_update(clean, now)
+            tracker_update(clean, time.time(), frame_ts)
 
             # Cache an annotated frame only occasionally (saves CPU = less lag)
             if clean and (now - last_annotated_at) >= ANNOTATED_SNAPSHOT_EVERY:
@@ -772,7 +827,7 @@ def inference_thread():
                 draw_tracks_and_summary(annotated)
                 with frame_lock:
                     globals()["last_annotated_frame"] = annotated
-                last_annotated_at = now
+                last_annotated_at = time.time()
 
         except Exception as e:
             print(f"[Infer] {type(e).__name__}: {e}")
@@ -1090,7 +1145,7 @@ def index():
 @app.route("/push_frame", methods=["POST"])
 def push_frame():
     """Receives live JPEG frames pushed over the internet by the ESP32-CAM."""
-    global latest_frame, frame_id, last_frame_push_time, pushed_frames_count
+    global latest_frame, frame_id, last_frame_push_time, pushed_frames_count, latest_frame_ts
 
     if CAM_PUSH_TOKEN:
         token = request.headers.get("X-Cam-Token", "")
@@ -1109,6 +1164,7 @@ def push_frame():
         latest_frame = frame
         frame_id += 1
         last_frame_push_time = time.time()
+        latest_frame_ts = last_frame_push_time
         pushed_frames_count += 1
         count = pushed_frames_count
 
