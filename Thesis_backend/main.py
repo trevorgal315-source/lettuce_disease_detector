@@ -56,8 +56,8 @@ if SUPABASE_KEY:
         print(f"[Supabase] Init failed: {e}")
 
 # ---------- Tuning & Automated Lettuce-Exclusive Filtering ----------
-INFER_INTERVAL = 0.15
-INFER_IMGSZ = 640
+INFER_INTERVAL = float(os.environ.get("INFER_INTERVAL", "0.10"))
+INFER_IMGSZ = int(os.environ.get("INFER_IMGSZ", "640"))  # try 480 on slow servers
 JPEG_QUALITY = 80
 MEMORY_TIME = 15.0
 CHUNK_SIZE = 8192
@@ -68,6 +68,16 @@ CONF_THRESHOLD = 0.25
 SESSION_FLUSH_INTERVAL = 60  # seconds (optional periodic flush if enabled)
 ENABLE_PERIODIC_FLUSH = os.environ.get("ENABLE_PERIODIC_FLUSH", "0") == "1"
 MIN_CONFIRMED_TO_SAVE = 1
+
+# ---------- Box smoothing / display tuning ----------
+SMOOTH_DURATION = 0.18   # seconds a box takes to glide to its newest position
+BOX_EMA_ALPHA = 0.6      # 0..1, higher = follows new detections faster, lower = steadier
+CONF_EMA_ALPHA = 0.3     # smoothing for the confidence number in the label
+FADE_IN_SECONDS = 0.25   # new boxes fade in instead of popping
+FADE_OUT_SECONDS = 2.0   # boxes fade out over the last seconds of MEMORY_TIME
+STALE_AFTER = 1.0        # seconds without a fresh detection -> thinner "remembered" box
+DEDUPE_IOU = 0.70        # overlapping detections above this are merged (keeps best conf)
+ANNOTATED_SNAPSHOT_EVERY = 2.0  # seconds between cached annotated frames
 
 # ---------- Colors & Strict Whitelist ----------
 COLOR_MAP = {
@@ -200,19 +210,48 @@ _end_timer_lock = threading.Lock()
 # Tracker
 # ======================================================================
 class Track:
-    __slots__ = ("track_id", "cls_votes", "box", "last_seen", "last_conf")
+    __slots__ = (
+        "track_id", "cls_votes", "box", "last_seen", "last_conf",
+        "first_seen", "smooth_conf", "anim",
+    )
 
     def __init__(self, track_id, cls_id, conf, box, now):
         self.track_id = track_id
         self.cls_votes = {cls_id: {"count": 1, "conf_sum": float(conf)}}
-        self.box = box
+        self.box = box  # raw last detection (used for matching)
         self.last_seen = now
         self.last_conf = float(conf)
+        self.first_seen = now
+        self.smooth_conf = float(conf)
+        fb = tuple(float(v) for v in box)
+        # anim = (start_box, target_box, start_time). Display position is a pure
+        # function of time, so every viewer / snapshot sees the same smooth box.
+        self.anim = (fb, fb, now)
+
+    def current_box(self, now):
+        """Smoothly interpolated box for drawing at time `now`."""
+        prev, target, t0 = self.anim
+        t = (now - t0) / SMOOTH_DURATION
+        t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+        t = t * t * (3.0 - 2.0 * t)  # smoothstep easing
+        return tuple(int(round(p + (q - p) * t)) for p, q in zip(prev, target))
 
     def update(self, cls_id, conf, box, now):
+        shown = self.current_box(now)  # where the box is drawn right now
+        old_target = self.anim[1]
+        new_target = tuple(
+            BOX_EMA_ALPHA * float(r) + (1.0 - BOX_EMA_ALPHA) * o
+            for r, o in zip(box, old_target)
+        )
+        # start gliding from the currently drawn position -> no visual jumps
+        self.anim = (tuple(float(v) for v in shown), new_target, now)
+
         self.box = box
         self.last_seen = now
         self.last_conf = float(conf)
+        self.smooth_conf = (
+            (1.0 - CONF_EMA_ALPHA) * self.smooth_conf + CONF_EMA_ALPHA * float(conf)
+        )
         v = self.cls_votes.get(cls_id)
         if v is None:
             self.cls_votes[cls_id] = {"count": 1, "conf_sum": float(conf)}
@@ -256,29 +295,45 @@ def compute_iou(a, b):
     return inter / float(areaA + areaB - inter + 1e-6)
 
 
+def dedupe_detections(dets):
+    """Drops duplicate overlapping boxes (e.g. same plant tagged twice) so only
+    one clean box is shown per plant. Keeps the highest-confidence one."""
+    kept = []
+    for d in sorted(dets, key=lambda x: x["conf"], reverse=True):
+        if all(compute_iou(d["box"], k["box"]) < DEDUPE_IOU for k in kept):
+            kept.append(d)
+    return kept
+
+
 def tracker_update(detections, now):
+    """Global best-first matching: the strongest overlaps are paired first, so
+    boxes keep the same ID/identity instead of swapping between neighbours."""
     global next_track_id
     with tracks_lock:
-        used = [False] * len(tracks)
-        for det in detections:
-            best_idx = -1
-            best_iou = IOU_MATCH_THRESHOLD
-            for i, tr in enumerate(tracks):
-                if used[i]:
-                    continue
+        pairs = []
+        for di, det in enumerate(detections):
+            for ti, tr in enumerate(tracks):
                 iou = compute_iou(tr.box, det["box"])
-                if iou > best_iou:
-                    best_iou = iou
-                    best_idx = i
-            if best_idx >= 0:
-                tracks[best_idx].update(det["cls_id"], det["conf"], det["box"], now)
-                used[best_idx] = True
-            else:
-                tracks.append(
-                    Track(next_track_id, det["cls_id"], det["conf"], det["box"], now)
-                )
-                used.append(True)
-                next_track_id += 1
+                if iou > IOU_MATCH_THRESHOLD:
+                    pairs.append((iou, di, ti))
+        pairs.sort(reverse=True)
+
+        used_d, used_t = set(), set()
+        for _iou, di, ti in pairs:
+            if di in used_d or ti in used_t:
+                continue
+            det = detections[di]
+            tracks[ti].update(det["cls_id"], det["conf"], det["box"], now)
+            used_d.add(di)
+            used_t.add(ti)
+
+        for di, det in enumerate(detections):
+            if di in used_d:
+                continue
+            tracks.append(
+                Track(next_track_id, det["cls_id"], det["conf"], det["box"], now)
+            )
+            next_track_id += 1
 
 
 def compute_class_counts(snapshot):
@@ -649,6 +704,7 @@ def extract_box(det):
 def inference_thread():
     last_infer = 0.0
     last_seen_frame = -1
+    last_annotated_at = 0.0
     while True:
         now = time.time()
         if now - last_infer < INFER_INTERVAL:
@@ -707,13 +763,16 @@ def inference_thread():
                     "box": box,
                 })
 
+            clean = dedupe_detections(clean)
             tracker_update(clean, now)
 
-            if clean:
+            # Cache an annotated frame only occasionally (saves CPU = less lag)
+            if clean and (now - last_annotated_at) >= ANNOTATED_SNAPSHOT_EVERY:
                 annotated = frame.copy()
                 draw_tracks_and_summary(annotated)
                 with frame_lock:
                     globals()["last_annotated_frame"] = annotated
+                last_annotated_at = now
 
         except Exception as e:
             print(f"[Infer] {type(e).__name__}: {e}")
@@ -727,33 +786,60 @@ def draw_tracks_and_summary(frame):
     with tracks_lock:
         snapshot = list(tracks)
 
-    # 1. Draw bounding boxes (only recently seen tracks; they fade after MEMORY_TIME)
+    # 1. Draw bounding boxes: smooth glide, fade in/out, readable labels
+    fh, fw = frame.shape[:2]
     for tr in snapshot:
         age = now - tr.last_seen
         if age > MEMORY_TIME:
             continue
+        if not tr.confirmed():
+            continue
         cls_id = tr.best_class()
         name = model.names.get(cls_id, "").strip().lower()
-
         if name not in VALID_CLASSES:
             continue
 
-        x1, y1, x2, y2 = tr.box
-        color = get_class_color(name)
+        # fade in when new, fade out as the memory expires
+        fade_in = min(1.0, (now - tr.first_seen) / FADE_IN_SECONDS)
+        remaining = MEMORY_TIME - age
+        fade_out = 1.0 if remaining >= FADE_OUT_SECONDS else max(0.0, remaining / FADE_OUT_SECONDS)
+        alpha = min(fade_in, fade_out)
+        if alpha < 0.08:
+            continue
+
+        x1, y1, x2, y2 = tr.current_box(now)
+        x1 = max(0, min(x1, fw - 1))
+        x2 = max(0, min(x2, fw - 1))
+        y1 = max(0, min(y1, fh - 1))
+        y2 = max(0, min(y2, fh - 1))
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            continue
+
+        base = get_class_color(name)
+        color = tuple(int(c * alpha) for c in base)
+        thickness = 3 if age <= STALE_AFTER else 2  # thinner = remembered, not live
+
         display_name = model.names.get(cls_id, str(cls_id))
-        if age < 0.5:
-            label = f"#{tr.track_id} {display_name} {tr.last_conf:.2f}"
-        else:
-            label = f"#{tr.track_id} {display_name} "
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        label = f"#{tr.track_id} {display_name} {tr.smooth_conf * 100:.0f}%"
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+
+        (tw, th), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1
+        )
+        ly2 = y1 if y1 - th - baseline - 6 >= 0 else y1 + th + baseline + 6
+        ly1 = ly2 - th - baseline - 6
+        lx2 = min(fw - 1, x1 + tw + 8)
+        cv2.rectangle(frame, (x1, ly1), (lx2, ly2), color, -1)
         cv2.putText(
             frame,
             label,
-            (x1, max(20, y1 - 10)),
+            (x1 + 4, ly2 - baseline - 3),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            color,
-            2,
+            0.55,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
         )
 
     # 2. Summary counts: every confirmed track, regardless of age or frame content.
@@ -768,7 +854,8 @@ def draw_tracks_and_summary(frame):
     summary_text = f"Total diseases: {diseased_total}"
 
     cv2.putText(
-        frame, summary_text, (12, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4
+        frame, summary_text, (12, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4,
+        cv2.LINE_AA,
     )
     cv2.putText(
         frame,
@@ -778,6 +865,7 @@ def draw_tracks_and_summary(frame):
         0.6,
         (255, 255, 255),
         2,
+        cv2.LINE_AA,
     )
 
 
