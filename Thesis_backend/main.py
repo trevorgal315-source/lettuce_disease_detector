@@ -17,14 +17,10 @@ from supabase import create_client, Client
 # Setup
 # ======================================================================
 app = Flask(__name__)
-
-MODEL_PATH = os.environ.get("MODEL_PATH", "best.pt")
-model = YOLO(MODEL_PATH)
+model = YOLO("best.pt")
 print(f"This model can detect: {model.names}")
 
-ESP32_CAM_URL = os.environ.get("ESP32_CAM_URL", "http://192.168.1.119:81/stream")
-ENABLE_LAN_READER = os.environ.get("ENABLE_LAN_READER", "1") == "1"
-CAM_PUSH_TOKEN = os.environ.get("CAM_PUSH_TOKEN", "")
+ESP32_CAM_URL = "http://192.168.1.119:81/stream"
 
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get(
@@ -36,9 +32,8 @@ SUPABASE_KEY = os.environ.get(
 if not SUPABASE_KEY:
     print("[Supabase] WARNING: SUPABASE_KEY not set - detections will NOT be saved.")
 
-TABLE_LIVE = os.environ.get("TABLE_LIVE", "live_sessions")
-TABLE_SCAN = os.environ.get("TABLE_SCAN", "scheduled_scans")
-SNAPSHOT_BUCKET = os.environ.get("SNAPSHOT_BUCKET", "session_snapshots")
+TABLE_LIVE = "live_sessions"
+TABLE_SCAN = "scheduled_scans"
 
 supabase: Client = None
 if SUPABASE_KEY:
@@ -49,17 +44,16 @@ if SUPABASE_KEY:
         print(f"[Supabase] Init failed: {e}")
 
 # ---------- Tuning & Automated Lettuce-Exclusive Filtering ----------
-INFER_INTERVAL = float(os.environ.get("INFER_INTERVAL", "0.15"))
-INFER_IMGSZ = int(os.environ.get("INFER_IMGSZ", "640"))
-JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "80"))
-MEMORY_TIME = float(os.environ.get("MEMORY_TIME", "15.0"))
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "8192"))
-IOU_MATCH_THRESHOLD = float(os.environ.get("IOU_MATCH_THRESHOLD", "0.15"))
-MIN_FRAMES_TO_CONFIRM = int(os.environ.get("MIN_FRAMES_TO_CONFIRM", "1"))
-CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.40"))
+INFER_INTERVAL = 0.15
+INFER_IMGSZ = 640
+JPEG_QUALITY = 80
+MEMORY_TIME = 15.0
+CHUNK_SIZE = 8192
+IOU_MATCH_THRESHOLD = 0.15
+MIN_FRAMES_TO_CONFIRM = 1
 
-SESSION_FLUSH_INTERVAL = int(os.environ.get("SESSION_FLUSH_INTERVAL", "60"))
-MIN_CONFIRMED_TO_SAVE = int(os.environ.get("MIN_CONFIRMED_TO_SAVE", "1"))
+SESSION_FLUSH_INTERVAL = 60  # seconds
+MIN_CONFIRMED_TO_SAVE = 1
 
 # ---------- Colors & Strict Whitelist ----------
 COLOR_MAP = {
@@ -80,11 +74,11 @@ def get_class_color(class_name: str):
 def is_exclusive_lettuce(frame, box, conf) -> bool:
     """
     Lettuce-Exclusive Validation Filter:
-    1. Enforces a confidence floor (0.40 by default) to allow valid detections.
+    1. Enforces a relaxed confidence floor (0.40) to allow valid detections.
     2. Uses a broader HSV color space mask to verify plant foliage and
        accommodate dark greens, yellow-greens, and disease lesions.
     """
-    if conf < CONF_THRESHOLD:
+    if conf < 0.40:
         return False
 
     try:
@@ -105,7 +99,10 @@ def is_exclusive_lettuce(frame, box, conf) -> bool:
         if crop.size == 0:
             return False
 
+        # Convert crop to HSV to evaluate foliage pigment
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+
+        # Expanded HSV range to include dark greens, yellows, and spots
         lower_foliage = np.array([5, 10, 10])
         upper_foliage = np.array([105, 255, 255])
 
@@ -114,12 +111,14 @@ def is_exclusive_lettuce(frame, box, conf) -> bool:
         total_pixels = box_width * box_height
 
         foliage_ratio = foliage_pixel_count / float(total_pixels)
+
+        # Requires at least 3% of the bounding box to match authentic plant tissue
         if foliage_ratio < 0.03:
             return False
 
         return True
     except Exception:
-        return True
+        return True  # Fallback if coordinate math encounters an edge case
 
 
 def health_label_for(diseased: int) -> str:
@@ -144,7 +143,7 @@ model_lock = threading.Lock()
 notif_lock = threading.Lock()
 notifications = deque(maxlen=200)
 
-NOTIF_FILE = os.environ.get("NOTIF_FILE", "notif_state.json")
+NOTIF_FILE = "notif_state.json"
 
 
 def _load_notif_counter():
@@ -167,7 +166,7 @@ def _save_notif_counter():
 
 
 # ======================================================================
-# Session state (Starts active for continuous healthy + diseased monitoring)
+# Session state (Continuous from startup; saves on stream exit or app exit)
 # ======================================================================
 session_lock = threading.Lock()
 session_active = True
@@ -265,6 +264,8 @@ def tracker_update(detections, now):
 # Supabase save - Live Stream Session
 # ======================================================================
 def _build_session_row():
+    global session_start_time
+
     with tracks_lock:
         snapshot = list(tracks)
 
@@ -293,9 +294,7 @@ def _build_session_row():
     bacterial = counts.get("bacterial leaf spot", 0)
     diseased = powdery + downy + bacterial
 
-    with session_lock:
-        start_ts = session_start_time
-    duration = int(time.time() - start_ts) if start_ts else 0
+    duration = int(time.time() - session_start_time) if session_start_time else 0
 
     row = {
         "overall_health": health_label_for(diseased),
@@ -340,13 +339,13 @@ def save_session_to_supabase():
                 file_bytes = encoded_img.tobytes()
                 file_name = f"session_{int(time.time())}.jpg"
 
-                supabase.storage.from_(SNAPSHOT_BUCKET).upload(
+                supabase.storage.from_("session_snapshots").upload(
                     path=file_name,
                     file=file_bytes,
                     file_options={"content-type": "image/jpeg"},
                 )
 
-                public_url_res = supabase.storage.from_(SNAPSHOT_BUCKET).get_public_url(
+                public_url_res = supabase.storage.from_("session_snapshots").get_public_url(
                     file_name
                 )
                 image_url = public_url_res
@@ -376,7 +375,7 @@ def on_client_connected():
             session_saved = False
             session_start_time = time.time()
             with tracks_lock:
-                tracks.clear()
+                tracks = []
                 next_track_id = 1
             print("[Session] Started. Tracker cleared.")
         else:
@@ -384,7 +383,7 @@ def on_client_connected():
 
 
 def on_client_disconnected(last_client: bool):
-    global session_active, session_saved, session_start_time
+    global session_active, session_saved, tracks, next_track_id, session_start_time
     if not last_client:
         return
 
@@ -398,7 +397,7 @@ def on_client_disconnected(last_client: bool):
     save_session_to_supabase()
 
     with tracks_lock:
-        tracks.clear()
+        tracks = []
         next_track_id = 1
 
     # Resume continuous monitoring automatically after stream exit
@@ -410,7 +409,7 @@ def on_client_disconnected(last_client: bool):
 
 
 def flush_on_app_exit(reason: str = "exit"):
-    global session_active, session_saved, session_start_time
+    global session_active, session_saved, tracks, next_track_id, session_start_time
     _stop_event.set()
     with session_lock:
         if session_saved or not session_active:
@@ -422,7 +421,7 @@ def flush_on_app_exit(reason: str = "exit"):
     save_session_to_supabase()
 
     with tracks_lock:
-        tracks.clear()
+        tracks = []
         next_track_id = 1
     with session_lock:
         session_start_time = None
@@ -552,12 +551,6 @@ def inference_thread():
             _stop_event.wait(0.01)
             continue
 
-        with session_lock:
-            active = session_active
-        if not active:
-            _stop_event.wait(0.05)
-            continue
-
         frame = None
         fid = -1
         with frame_lock:
@@ -575,10 +568,7 @@ def inference_thread():
         try:
             with model_lock:
                 results = model.predict(
-                    source=frame,
-                    conf=CONF_THRESHOLD,
-                    imgsz=INFER_IMGSZ,
-                    verbose=False,
+                    source=frame, conf=0.40, imgsz=INFER_IMGSZ, verbose=False
                 )
             r0 = results[0]
 
@@ -603,6 +593,7 @@ def inference_thread():
 
                 conf = float(det.conf[0]) if det.conf is not None else 0.0
 
+                # --- EXCLUSIVE AUTOMATED LETTUCE CHECK ---
                 if not is_exclusive_lettuce(frame, box, conf):
                     continue
 
@@ -626,6 +617,7 @@ def draw_tracks_and_summary(frame):
     with tracks_lock:
         snapshot = list(tracks)
 
+    # 1. Draw bounding boxes
     for tr in snapshot:
         age = now - tr.last_seen
         if age > MEMORY_TIME:
@@ -657,6 +649,7 @@ def draw_tracks_and_summary(frame):
             2,
         )
 
+    # 2. Compute counts for the summary banner
     counts = {}
     for tr in snapshot:
         if not tr.confirmed():
@@ -673,6 +666,7 @@ def draw_tracks_and_summary(frame):
     bacterial = counts.get("bacterial leaf spot", 0)
     diseased_total = powdery + downy + bacterial
 
+    # 3. Draw summary bar with total diseases only, positioned at Y=80
     summary_text = f"total diseses : {diseased_total}"
 
     cv2.putText(
@@ -750,7 +744,7 @@ def generate_frames():
 def analyze_image(frame):
     with model_lock:
         results = model.predict(
-            source=frame, conf=CONF_THRESHOLD, imgsz=INFER_IMGSZ, verbose=False
+            source=frame, conf=0.40, imgsz=INFER_IMGSZ, verbose=False
         )
     r0 = results[0]
 
@@ -773,6 +767,7 @@ def analyze_image(frame):
 
         conf = float(det.conf[0]) if det.conf is not None else 0.0
 
+        # --- EXCLUSIVE AUTOMATED LETTUCE CHECK ---
         if not is_exclusive_lettuce(frame, box, conf):
             continue
 
@@ -885,28 +880,6 @@ HTML_PAGE = """
 @app.route("/")
 def index():
     return render_template_string(HTML_PAGE)
-
-
-@app.route("/push_frame", methods=["POST"])
-def push_frame():
-    global latest_frame, frame_id
-    if CAM_PUSH_TOKEN:
-        if request.headers.get("X-Cam-Token", "") != CAM_PUSH_TOKEN:
-            return jsonify({"error": "unauthorized"}), 401
-
-    data = request.get_data()
-    if not data:
-        return jsonify({"error": "empty body"}), 400
-
-    frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    if frame is None:
-        return jsonify({"error": "bad image"}), 400
-
-    with frame_lock:
-        latest_frame = frame
-        frame_id += 1
-
-    return jsonify({"ok": True, "frame_id": frame_id})
 
 
 @app.route("/video_feed")
@@ -1028,15 +1001,9 @@ def force_save_session():
 # ======================================================================
 # Main
 # ======================================================================
-def _start_workers():
-    if ENABLE_LAN_READER:
-        threading.Thread(target=reader_thread, daemon=True).start()
-    threading.Thread(target=inference_thread, daemon=True).start()
-
-
-_start_workers()
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    print(f"[Main] Threads started. Serving on http://0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    threading.Thread(target=reader_thread, daemon=True).start()
+    threading.Thread(target=inference_thread, daemon=True).start()
+    # threading.Thread(target=session_flush_thread, daemon=True).start()
+    print("[Main] Threads started. Serving on http://0.0.0.0:5000")
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
