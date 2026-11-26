@@ -17,8 +17,7 @@ from supabase import create_client, Client
 # Setup
 # ======================================================================
 app = Flask(__name__)
-MODEL_PATH = os.environ.get("MODEL_PATH", "best.pt")  # e.g. best.onnx for faster CPU
-model = YOLO(MODEL_PATH)
+model = YOLO("best.pt")
 print(f"This model can detect: {model.names}")
 
 ESP32_CAM_URL = os.environ.get("ESP32_CAM_URL", "http://192.168.1.119:81/stream")
@@ -29,10 +28,6 @@ ENABLE_LAN_READER = os.environ.get("ENABLE_LAN_READER", "0") == "1"
 CAM_PUSH_TOKEN = os.environ.get("CAM_PUSH_TOKEN", "")
 CAM_ONLINE_TIMEOUT = 10.0  # seconds without a pushed frame before marking camera offline
 CLIENT_IDLE_TIMEOUT = 12.0  # seconds without yielding a frame before ending client
-
-# How long to keep the session (and its disease total) alive after the last
-# viewer disconnects. If a viewer returns within this window, the totals continue.
-SESSION_GRACE_SECONDS = float(os.environ.get("SESSION_GRACE_SECONDS", "60"))
 
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get(
@@ -57,9 +52,9 @@ if SUPABASE_KEY:
         print(f"[Supabase] Init failed: {e}")
 
 # ---------- Tuning & Automated Lettuce-Exclusive Filtering ----------
-INFER_INTERVAL = float(os.environ.get("INFER_INTERVAL", "0.0"))  # 0 = run as fast as the model allows
-INFER_IMGSZ = int(os.environ.get("INFER_IMGSZ", "480"))  # 416/320 = faster, 640 = more detail
-JPEG_QUALITY = 75
+INFER_INTERVAL = 0.15
+INFER_IMGSZ = 640
+JPEG_QUALITY = 80
 MEMORY_TIME = 15.0
 CHUNK_SIZE = 8192
 IOU_MATCH_THRESHOLD = 0.15
@@ -69,25 +64,6 @@ CONF_THRESHOLD = 0.25
 SESSION_FLUSH_INTERVAL = 60  # seconds (optional periodic flush if enabled)
 ENABLE_PERIODIC_FLUSH = os.environ.get("ENABLE_PERIODIC_FLUSH", "0") == "1"
 MIN_CONFIRMED_TO_SAVE = 1
-
-# ---------- Box smoothing / display tuning ----------
-SMOOTH_DURATION = 0.12   # seconds a box takes to glide to its newest position
-BOX_EMA_ALPHA = 0.8      # 0..1, higher = follows new detections faster, lower = steadier
-CONF_EMA_ALPHA = 0.3     # smoothing for the confidence number in the label
-FADE_IN_SECONDS = 0.12   # new boxes fade in instead of popping
-FADE_OUT_SECONDS = 2.0   # boxes fade out over the last seconds of MEMORY_TIME
-STALE_AFTER = 1.0        # seconds without a fresh detection -> thinner "remembered" box
-DEDUPE_IOU = 0.70        # overlapping detections above this are merged (keeps best conf)
-ANNOTATED_SNAPSHOT_EVERY = 2.0  # seconds between cached annotated frames
-
-# ---------- Latency compensation (motion prediction) ----------
-# Boxes come from a frame that is a few hundred ms old. We estimate each box's
-# velocity and project it forward to "now", so boxes sit on the plant in the
-# LIVE video and keep moving smoothly between detections.
-MAX_EXTRAPOLATE = 0.50   # max seconds to project ahead
-VEL_EMA_ALPHA = 0.5      # smoothing of the velocity estimate
-VEL_DEADZONE = 20.0      # px/s below this is treated as "not moving" (kills jitter drift)
-VEL_MAX = 500.0          # px/s sanity cap
 
 # ---------- Colors & Strict Whitelist ----------
 COLOR_MAP = {
@@ -107,7 +83,7 @@ def get_class_color(class_name: str):
 
 def is_exclusive_lettuce(frame, box, conf) -> bool:
     """
-    Lettuce-Exclusive Validation Filter (applied ONCE, at detection time):
+    Lettuce-Exclusive Validation Filter:
     1. Enforces a confidence floor (0.25) to allow valid healthy & infected detections.
     2. Uses a broader HSV color space mask to verify plant foliage and
        accommodate dark greens, yellow-greens, bright highlights, and lesions.
@@ -164,7 +140,6 @@ def health_label_for(diseased: int) -> str:
 # Shared state
 # ======================================================================
 latest_frame = None
-latest_frame_ts = 0.0  # when the newest frame arrived (capture time)
 last_annotated_frame = None
 frame_lock = threading.Lock()
 frame_id = 0
@@ -213,90 +188,25 @@ session_active = False
 session_saved = False
 session_start_time = None
 _shutting_down = False
-_end_timer = None
-_end_timer_lock = threading.Lock()
 
 
 # ======================================================================
 # Tracker
 # ======================================================================
 class Track:
-    __slots__ = (
-        "track_id", "cls_votes", "box", "last_seen", "last_conf",
-        "first_seen", "smooth_conf", "anim",
-    )
+    __slots__ = ("track_id", "cls_votes", "box", "last_seen", "last_conf")
 
-    def __init__(self, track_id, cls_id, conf, box, now, frame_ts):
+    def __init__(self, track_id, cls_id, conf, box, now):
         self.track_id = track_id
         self.cls_votes = {cls_id: {"count": 1, "conf_sum": float(conf)}}
-        self.box = box  # raw last detection (used for matching)
-        self.last_seen = now
-        self.last_conf = float(conf)
-        self.first_seen = now
-        self.smooth_conf = float(conf)
-        fb = tuple(float(v) for v in box)
-        # anim = (start_box, target_box, start_time, velocity(px/s), frame_ts)
-        # Display position is a pure function of time, so every viewer and every
-        # saved snapshot sees the same smooth box.
-        self.anim = (fb, fb, now, (0.0, 0.0), frame_ts)
-
-    @staticmethod
-    def _offset(vel, now, frame_ts):
-        """How far the plant has probably moved since the detection frame."""
-        dt = now - frame_ts
-        dt = 0.0 if dt < 0.0 else MAX_EXTRAPOLATE if dt > MAX_EXTRAPOLATE else dt
-        dx, dy = vel[0] * dt, vel[1] * dt
-        return (dx, dy, dx, dy)
-
-    def current_box(self, now):
-        """Smoothly interpolated + motion-compensated box for drawing at `now`."""
-        prev, target, t0, vel, fts = self.anim
-        t = (now - t0) / SMOOTH_DURATION
-        t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
-        t = t * t * (3.0 - 2.0 * t)  # smoothstep easing
-        off = self._offset(vel, now, fts)
-        return tuple(
-            int(round(p + (q - p) * t + o)) for p, q, o in zip(prev, target, off)
-        )
-
-    def update(self, cls_id, conf, box, now, frame_ts):
-        shown = self.current_box(now)  # where the box is drawn right now
-        _, old_target, _, old_vel, old_fts = self.anim
-
-        # --- velocity estimate from consecutive raw detections ---
-        vel = old_vel
-        dt = frame_ts - old_fts
-        if 0.02 < dt < 1.0:
-            ocx = (self.box[0] + self.box[2]) / 2.0
-            ocy = (self.box[1] + self.box[3]) / 2.0
-            ncx = (box[0] + box[2]) / 2.0
-            ncy = (box[1] + box[3]) / 2.0
-            vx = max(-VEL_MAX, min(VEL_MAX, (ncx - ocx) / dt))
-            vy = max(-VEL_MAX, min(VEL_MAX, (ncy - ocy) / dt))
-            vx = (1.0 - VEL_EMA_ALPHA) * old_vel[0] + VEL_EMA_ALPHA * vx
-            vy = (1.0 - VEL_EMA_ALPHA) * old_vel[1] + VEL_EMA_ALPHA * vy
-            if (vx * vx + vy * vy) ** 0.5 < VEL_DEADZONE:
-                vx = vy = 0.0
-            vel = (vx, vy)
-        elif dt >= 1.0:
-            vel = (0.0, 0.0)  # track was lost for a while: don't extrapolate
-
-        new_target = tuple(
-            BOX_EMA_ALPHA * float(r) + (1.0 - BOX_EMA_ALPHA) * o
-            for r, o in zip(box, old_target)
-        )
-        # Start gliding from the position currently on screen (minus the new
-        # offset that gets added back on top) -> no visual jumps.
-        off_new = self._offset(vel, now, frame_ts)
-        start = tuple(float(s) - o for s, o in zip(shown, off_new))
-        self.anim = (start, new_target, now, vel, frame_ts)
-
         self.box = box
         self.last_seen = now
         self.last_conf = float(conf)
-        self.smooth_conf = (
-            (1.0 - CONF_EMA_ALPHA) * self.smooth_conf + CONF_EMA_ALPHA * float(conf)
-        )
+
+    def update(self, cls_id, conf, box, now):
+        self.box = box
+        self.last_seen = now
+        self.last_conf = float(conf)
         v = self.cls_votes.get(cls_id)
         if v is None:
             self.cls_votes[cls_id] = {"count": 1, "conf_sum": float(conf)}
@@ -340,65 +250,29 @@ def compute_iou(a, b):
     return inter / float(areaA + areaB - inter + 1e-6)
 
 
-def dedupe_detections(dets):
-    """Drops duplicate overlapping boxes (e.g. same plant tagged twice) so only
-    one clean box is shown per plant. Keeps the highest-confidence one."""
-    kept = []
-    for d in sorted(dets, key=lambda x: x["conf"], reverse=True):
-        if all(compute_iou(d["box"], k["box"]) < DEDUPE_IOU for k in kept):
-            kept.append(d)
-    return kept
-
-
-def tracker_update(detections, now, frame_ts=None):
-    """Global best-first matching: the strongest overlaps are paired first, so
-    boxes keep the same ID/identity instead of swapping between neighbours."""
+def tracker_update(detections, now):
     global next_track_id
-    if frame_ts is None:
-        frame_ts = now
     with tracks_lock:
-        pairs = []
-        for di, det in enumerate(detections):
-            for ti, tr in enumerate(tracks):
+        used = [False] * len(tracks)
+        for det in detections:
+            best_idx = -1
+            best_iou = IOU_MATCH_THRESHOLD
+            for i, tr in enumerate(tracks):
+                if used[i]:
+                    continue
                 iou = compute_iou(tr.box, det["box"])
-                if iou > IOU_MATCH_THRESHOLD:
-                    pairs.append((iou, di, ti))
-        pairs.sort(reverse=True)
-
-        used_d, used_t = set(), set()
-        for _iou, di, ti in pairs:
-            if di in used_d or ti in used_t:
-                continue
-            det = detections[di]
-            tracks[ti].update(det["cls_id"], det["conf"], det["box"], now, frame_ts)
-            used_d.add(di)
-            used_t.add(ti)
-
-        for di, det in enumerate(detections):
-            if di in used_d:
-                continue
-            tracks.append(
-                Track(next_track_id, det["cls_id"], det["conf"], det["box"], now, frame_ts)
-            )
-            next_track_id += 1
-
-
-def compute_class_counts(snapshot):
-    """
-    Counts every confirmed track by class. This does NOT depend on track age
-    or on the current frame content, so the total never drops just because a
-    plant is out of view or its box has faded. Tracks were already validated
-    as lettuce at detection time in inference_thread().
-    """
-    counts = {}
-    for tr in snapshot:
-        if not tr.confirmed():
-            continue
-        name = model.names.get(tr.best_class(), "").strip().lower()
-        if name not in VALID_CLASSES:
-            continue
-        counts[name] = counts.get(name, 0) + 1
-    return counts
+                if iou > best_iou:
+                    best_iou = iou
+                    best_idx = i
+            if best_idx >= 0:
+                tracks[best_idx].update(det["cls_id"], det["conf"], det["box"], now)
+                used[best_idx] = True
+            else:
+                tracks.append(
+                    Track(next_track_id, det["cls_id"], det["conf"], det["box"], now)
+                )
+                used.append(True)
+                next_track_id += 1
 
 
 # ======================================================================
@@ -550,18 +424,8 @@ def _reset_session_tracks_locked():
 # ======================================================================
 # Session lifecycle & exit handlers
 # ======================================================================
-def _cancel_end_timer():
-    global _end_timer
-    with _end_timer_lock:
-        if _end_timer is not None:
-            _end_timer.cancel()
-            _end_timer = None
-
-
 def on_client_connected():
     global session_active, session_saved, session_start_time
-    # A viewer came back during the grace period: keep the same session & totals.
-    _cancel_end_timer()
     with session_lock:
         if not session_active:
             session_active = True
@@ -569,19 +433,12 @@ def on_client_connected():
             session_start_time = time.time()
             _reset_session_tracks_locked()
             print("[Session] Started. Tracker cleared.")
-        else:
-            print("[Session] Viewer returned. Continuing existing session.")
 
 
-def _finalize_session():
-    """Runs after the grace period if nobody reconnected."""
-    global session_active, session_saved, _end_timer
-    with _end_timer_lock:
-        _end_timer = None
-
-    with clients_lock:
-        if active_clients > 0:
-            return
+def on_client_disconnected(last_client: bool):
+    global session_active, session_saved
+    if not last_client:
+        return
 
     with session_lock:
         if not session_active or session_saved:
@@ -589,38 +446,16 @@ def _finalize_session():
         session_saved = True
         session_active = False
 
-    print("[Session] Grace period over. Saving session with bounding boxes to Supabase...")
+    print("[Session] Stream ended. Saving session with bounding boxes to Supabase...")
     save_session_to_supabase(force=False)
     with session_lock:
         _reset_session_tracks_locked()
     print("[Session] Tracker reset. Ready for next session.")
 
 
-def on_client_disconnected(last_client: bool):
-    global _end_timer
-    if not last_client:
-        return
-
-    with session_lock:
-        if not session_active or session_saved:
-            return
-
-    _cancel_end_timer()
-    print(
-        f"[Session] Last viewer left. Keeping totals for {SESSION_GRACE_SECONDS:.0f}s "
-        f"before saving."
-    )
-    timer = threading.Timer(SESSION_GRACE_SECONDS, _finalize_session)
-    timer.daemon = True
-    with _end_timer_lock:
-        _end_timer = timer
-    timer.start()
-
-
 def flush_active_session_on_exit(reason: str = "exit"):
     """Ensures any active or unsaved tracked detections are saved when app exits."""
     global session_active, session_saved, _shutting_down
-    _cancel_end_timer()
     with session_lock:
         if _shutting_down and session_saved:
             return
@@ -671,7 +506,7 @@ def session_flush_thread():
 # Reader thread (Optional LAN stream reader; use /push_frame over internet)
 # ======================================================================
 def reader_thread():
-    global latest_frame, frame_id, last_frame_push_time, latest_frame_ts
+    global latest_frame, frame_id, last_frame_push_time
     session = requests.Session()
     backoff = 1
 
@@ -720,7 +555,6 @@ def reader_thread():
                             latest_frame = frame
                             frame_id += 1
                             last_frame_push_time = time.time()
-                            latest_frame_ts = last_frame_push_time
 
         except Exception as e:
             print(f"[Reader] Connection dropped: {e}. Reconnecting in {backoff}s...")
@@ -752,7 +586,6 @@ def extract_box(det):
 def inference_thread():
     last_infer = 0.0
     last_seen_frame = -1
-    last_annotated_at = 0.0
     while True:
         now = time.time()
         if now - last_infer < INFER_INTERVAL:
@@ -761,15 +594,13 @@ def inference_thread():
 
         frame = None
         fid = -1
-        frame_ts = 0.0
         with frame_lock:
             if latest_frame is not None:
                 fid = frame_id
-                frame = latest_frame  # no copy needed: inference never modifies it
-                frame_ts = latest_frame_ts
+                frame = latest_frame.copy()
 
         if frame is None or fid == last_seen_frame:
-            time.sleep(0.005)
+            time.sleep(0.02)
             continue
 
         last_seen_frame = fid
@@ -778,12 +609,7 @@ def inference_thread():
         try:
             with model_lock:
                 results = model.predict(
-                    source=frame,
-                    conf=CONF_THRESHOLD,
-                    imgsz=INFER_IMGSZ,
-                    verbose=False,
-                    agnostic_nms=True,  # one box per plant even if classes disagree
-                    max_det=30,
+                    source=frame, conf=CONF_THRESHOLD, imgsz=INFER_IMGSZ, verbose=False
                 )
             r0 = results[0]
 
@@ -808,7 +634,6 @@ def inference_thread():
 
                 conf = float(det.conf[0]) if det.conf is not None else 0.0
 
-                # Lettuce validation happens here, once, at detection time.
                 if not is_exclusive_lettuce(frame, box, conf):
                     continue
 
@@ -818,16 +643,13 @@ def inference_thread():
                     "box": box,
                 })
 
-            clean = dedupe_detections(clean)
-            tracker_update(clean, time.time(), frame_ts)
+            tracker_update(clean, now)
 
-            # Cache an annotated frame only occasionally (saves CPU = less lag)
-            if clean and (now - last_annotated_at) >= ANNOTATED_SNAPSHOT_EVERY:
+            if clean:
                 annotated = frame.copy()
                 draw_tracks_and_summary(annotated)
                 with frame_lock:
                     globals()["last_annotated_frame"] = annotated
-                last_annotated_at = time.time()
 
         except Exception as e:
             print(f"[Infer] {type(e).__name__}: {e}")
@@ -841,76 +663,60 @@ def draw_tracks_and_summary(frame):
     with tracks_lock:
         snapshot = list(tracks)
 
-    # 1. Draw bounding boxes: smooth glide, fade in/out, readable labels
-    fh, fw = frame.shape[:2]
+    # 1. Draw bounding boxes
     for tr in snapshot:
         age = now - tr.last_seen
         if age > MEMORY_TIME:
             continue
-        if not tr.confirmed():
-            continue
         cls_id = tr.best_class()
         name = model.names.get(cls_id, "").strip().lower()
+
         if name not in VALID_CLASSES:
             continue
 
-        # fade in when new, fade out as the memory expires
-        fade_in = min(1.0, (now - tr.first_seen) / FADE_IN_SECONDS)
-        remaining = MEMORY_TIME - age
-        fade_out = 1.0 if remaining >= FADE_OUT_SECONDS else max(0.0, remaining / FADE_OUT_SECONDS)
-        alpha = min(fade_in, fade_out)
-        if alpha < 0.08:
+        if not is_exclusive_lettuce(frame, tr.box, tr.best_confidence()):
             continue
 
-        x1, y1, x2, y2 = tr.current_box(now)
-        x1 = max(0, min(x1, fw - 1))
-        x2 = max(0, min(x2, fw - 1))
-        y1 = max(0, min(y1, fh - 1))
-        y2 = max(0, min(y2, fh - 1))
-        if x2 - x1 < 4 or y2 - y1 < 4:
-            continue
-
-        base = get_class_color(name)
-        color = tuple(int(c * alpha) for c in base)
-        thickness = 3 if age <= STALE_AFTER else 2  # thinner = remembered, not live
-
+        x1, y1, x2, y2 = tr.box
+        color = get_class_color(name)
         display_name = model.names.get(cls_id, str(cls_id))
-        label = f"#{tr.track_id} {display_name} {tr.smooth_conf * 100:.0f}%"
-
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-
-        (tw, th), baseline = cv2.getTextSize(
-            label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1
-        )
-        ly2 = y1 if y1 - th - baseline - 6 >= 0 else y1 + th + baseline + 6
-        ly1 = ly2 - th - baseline - 6
-        lx2 = min(fw - 1, x1 + tw + 8)
-        cv2.rectangle(frame, (x1, ly1), (lx2, ly2), color, -1)
+        if age < 0.5:
+            label = f"#{tr.track_id} {display_name} {tr.last_conf:.2f}"
+        else:
+            label = f"#{tr.track_id} {display_name} "
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
         cv2.putText(
             frame,
             label,
-            (x1 + 4, ly2 - baseline - 3),
+            (x1, max(20, y1 - 10)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
+            0.7,
+            color,
+            2,
         )
 
-    # 2. Summary counts: every confirmed track, regardless of age or frame content.
-    counts = compute_class_counts(snapshot)
+    # 2. Compute counts for the summary banner
+    counts = {}
+    for tr in snapshot:
+        if not tr.confirmed():
+            continue
+        name = model.names.get(tr.best_class(), "").strip().lower()
+        if name not in VALID_CLASSES:
+            continue
+        if not is_exclusive_lettuce(frame, tr.box, tr.best_confidence()):
+            continue
+        counts[name] = counts.get(name, 0) + 1
 
     powdery = counts.get("powdery mildew", 0)
     downy = counts.get("downy mildew", 0)
     bacterial = counts.get("bacterial leaf spot", 0)
     diseased_total = powdery + downy + bacterial
 
-    # 3. Draw summary bar with total diseases, positioned at Y=80
-    summary_text = f"Total diseases: {diseased_total}"
+    # 3. Draw summary bar with total diseases only, positioned at Y=80
+    summary_text = f"total diseses : {diseased_total}"
 
     cv2.putText(
-        frame, summary_text, (12, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4,
-        cv2.LINE_AA,
+        frame, summary_text, (12, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4
     )
     cv2.putText(
         frame,
@@ -920,7 +726,6 @@ def draw_tracks_and_summary(frame):
         0.6,
         (255, 255, 255),
         2,
-        cv2.LINE_AA,
     )
 
 
@@ -939,8 +744,6 @@ def generate_frames():
         is_first = active_clients == 1
     if is_first:
         on_client_connected()
-    else:
-        _cancel_end_timer()
     print(f"[Stream] Client connected. Active: {active_clients}")
 
     last_yielded = -1
@@ -1145,7 +948,7 @@ def index():
 @app.route("/push_frame", methods=["POST"])
 def push_frame():
     """Receives live JPEG frames pushed over the internet by the ESP32-CAM."""
-    global latest_frame, frame_id, last_frame_push_time, pushed_frames_count, latest_frame_ts
+    global latest_frame, frame_id, last_frame_push_time, pushed_frames_count
 
     if CAM_PUSH_TOKEN:
         token = request.headers.get("X-Cam-Token", "")
@@ -1164,7 +967,6 @@ def push_frame():
         latest_frame = frame
         frame_id += 1
         last_frame_push_time = time.time()
-        latest_frame_ts = last_frame_push_time
         pushed_frames_count += 1
         count = pushed_frames_count
 
@@ -1249,7 +1051,16 @@ def counts_api():
     with tracks_lock:
         snapshot = list(tracks)
 
-    per_class = compute_class_counts(snapshot)
+    per_class = {}
+    for tr in snapshot:
+        if not tr.confirmed():
+            continue
+        name = model.names.get(tr.best_class(), "").strip().lower()
+
+        if name not in VALID_CLASSES:
+            continue
+
+        per_class[name] = per_class.get(name, 0) + 1
 
     total = sum(per_class.values())
     healthy = per_class.get("healthy", 0)
@@ -1261,7 +1072,6 @@ def counts_api():
         "total_unique_plants": total,
         "healthy": healthy,
         "diseased": diseased,
-        "total_diseases": diseased,  # same number shown on the video overlay
     })
 
 
