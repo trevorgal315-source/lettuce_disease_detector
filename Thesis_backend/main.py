@@ -29,6 +29,10 @@ CAM_PUSH_TOKEN = os.environ.get("CAM_PUSH_TOKEN", "")
 CAM_ONLINE_TIMEOUT = 10.0  # seconds without a pushed frame before marking camera offline
 CLIENT_IDLE_TIMEOUT = 12.0  # seconds without yielding a frame before ending client
 
+# How long to keep the session (and its disease total) alive after the last
+# viewer disconnects. If a viewer returns within this window, the totals continue.
+SESSION_GRACE_SECONDS = float(os.environ.get("SESSION_GRACE_SECONDS", "60"))
+
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get(
     "SUPABASE_URL", "https://jodqigqgnxiakhcdnzlw.supabase.co"
@@ -83,7 +87,7 @@ def get_class_color(class_name: str):
 
 def is_exclusive_lettuce(frame, box, conf) -> bool:
     """
-    Lettuce-Exclusive Validation Filter:
+    Lettuce-Exclusive Validation Filter (applied ONCE, at detection time):
     1. Enforces a confidence floor (0.25) to allow valid healthy & infected detections.
     2. Uses a broader HSV color space mask to verify plant foliage and
        accommodate dark greens, yellow-greens, bright highlights, and lesions.
@@ -188,6 +192,8 @@ session_active = False
 session_saved = False
 session_start_time = None
 _shutting_down = False
+_end_timer = None
+_end_timer_lock = threading.Lock()
 
 
 # ======================================================================
@@ -273,6 +279,24 @@ def tracker_update(detections, now):
                 )
                 used.append(True)
                 next_track_id += 1
+
+
+def compute_class_counts(snapshot):
+    """
+    Counts every confirmed track by class. This does NOT depend on track age
+    or on the current frame content, so the total never drops just because a
+    plant is out of view or its box has faded. Tracks were already validated
+    as lettuce at detection time in inference_thread().
+    """
+    counts = {}
+    for tr in snapshot:
+        if not tr.confirmed():
+            continue
+        name = model.names.get(tr.best_class(), "").strip().lower()
+        if name not in VALID_CLASSES:
+            continue
+        counts[name] = counts.get(name, 0) + 1
+    return counts
 
 
 # ======================================================================
@@ -424,8 +448,18 @@ def _reset_session_tracks_locked():
 # ======================================================================
 # Session lifecycle & exit handlers
 # ======================================================================
+def _cancel_end_timer():
+    global _end_timer
+    with _end_timer_lock:
+        if _end_timer is not None:
+            _end_timer.cancel()
+            _end_timer = None
+
+
 def on_client_connected():
     global session_active, session_saved, session_start_time
+    # A viewer came back during the grace period: keep the same session & totals.
+    _cancel_end_timer()
     with session_lock:
         if not session_active:
             session_active = True
@@ -433,12 +467,19 @@ def on_client_connected():
             session_start_time = time.time()
             _reset_session_tracks_locked()
             print("[Session] Started. Tracker cleared.")
+        else:
+            print("[Session] Viewer returned. Continuing existing session.")
 
 
-def on_client_disconnected(last_client: bool):
-    global session_active, session_saved
-    if not last_client:
-        return
+def _finalize_session():
+    """Runs after the grace period if nobody reconnected."""
+    global session_active, session_saved, _end_timer
+    with _end_timer_lock:
+        _end_timer = None
+
+    with clients_lock:
+        if active_clients > 0:
+            return
 
     with session_lock:
         if not session_active or session_saved:
@@ -446,16 +487,38 @@ def on_client_disconnected(last_client: bool):
         session_saved = True
         session_active = False
 
-    print("[Session] Stream ended. Saving session with bounding boxes to Supabase...")
+    print("[Session] Grace period over. Saving session with bounding boxes to Supabase...")
     save_session_to_supabase(force=False)
     with session_lock:
         _reset_session_tracks_locked()
     print("[Session] Tracker reset. Ready for next session.")
 
 
+def on_client_disconnected(last_client: bool):
+    global _end_timer
+    if not last_client:
+        return
+
+    with session_lock:
+        if not session_active or session_saved:
+            return
+
+    _cancel_end_timer()
+    print(
+        f"[Session] Last viewer left. Keeping totals for {SESSION_GRACE_SECONDS:.0f}s "
+        f"before saving."
+    )
+    timer = threading.Timer(SESSION_GRACE_SECONDS, _finalize_session)
+    timer.daemon = True
+    with _end_timer_lock:
+        _end_timer = timer
+    timer.start()
+
+
 def flush_active_session_on_exit(reason: str = "exit"):
     """Ensures any active or unsaved tracked detections are saved when app exits."""
     global session_active, session_saved, _shutting_down
+    _cancel_end_timer()
     with session_lock:
         if _shutting_down and session_saved:
             return
@@ -634,6 +697,7 @@ def inference_thread():
 
                 conf = float(det.conf[0]) if det.conf is not None else 0.0
 
+                # Lettuce validation happens here, once, at detection time.
                 if not is_exclusive_lettuce(frame, box, conf):
                     continue
 
@@ -663,7 +727,7 @@ def draw_tracks_and_summary(frame):
     with tracks_lock:
         snapshot = list(tracks)
 
-    # 1. Draw bounding boxes
+    # 1. Draw bounding boxes (only recently seen tracks; they fade after MEMORY_TIME)
     for tr in snapshot:
         age = now - tr.last_seen
         if age > MEMORY_TIME:
@@ -672,9 +736,6 @@ def draw_tracks_and_summary(frame):
         name = model.names.get(cls_id, "").strip().lower()
 
         if name not in VALID_CLASSES:
-            continue
-
-        if not is_exclusive_lettuce(frame, tr.box, tr.best_confidence()):
             continue
 
         x1, y1, x2, y2 = tr.box
@@ -695,25 +756,16 @@ def draw_tracks_and_summary(frame):
             2,
         )
 
-    # 2. Compute counts for the summary banner
-    counts = {}
-    for tr in snapshot:
-        if not tr.confirmed():
-            continue
-        name = model.names.get(tr.best_class(), "").strip().lower()
-        if name not in VALID_CLASSES:
-            continue
-        if not is_exclusive_lettuce(frame, tr.box, tr.best_confidence()):
-            continue
-        counts[name] = counts.get(name, 0) + 1
+    # 2. Summary counts: every confirmed track, regardless of age or frame content.
+    counts = compute_class_counts(snapshot)
 
     powdery = counts.get("powdery mildew", 0)
     downy = counts.get("downy mildew", 0)
     bacterial = counts.get("bacterial leaf spot", 0)
     diseased_total = powdery + downy + bacterial
 
-    # 3. Draw summary bar with total diseases only, positioned at Y=80
-    summary_text = f"total diseses : {diseased_total}"
+    # 3. Draw summary bar with total diseases, positioned at Y=80
+    summary_text = f"Total diseases: {diseased_total}"
 
     cv2.putText(
         frame, summary_text, (12, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4
@@ -744,6 +796,8 @@ def generate_frames():
         is_first = active_clients == 1
     if is_first:
         on_client_connected()
+    else:
+        _cancel_end_timer()
     print(f"[Stream] Client connected. Active: {active_clients}")
 
     last_yielded = -1
@@ -1051,16 +1105,7 @@ def counts_api():
     with tracks_lock:
         snapshot = list(tracks)
 
-    per_class = {}
-    for tr in snapshot:
-        if not tr.confirmed():
-            continue
-        name = model.names.get(tr.best_class(), "").strip().lower()
-
-        if name not in VALID_CLASSES:
-            continue
-
-        per_class[name] = per_class.get(name, 0) + 1
+    per_class = compute_class_counts(snapshot)
 
     total = sum(per_class.values())
     healthy = per_class.get("healthy", 0)
@@ -1072,6 +1117,7 @@ def counts_api():
         "total_unique_plants": total,
         "healthy": healthy,
         "diseased": diseased,
+        "total_diseases": diseased,  # same number shown on the video overlay
     })
 
 
