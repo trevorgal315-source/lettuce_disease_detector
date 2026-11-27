@@ -31,8 +31,9 @@ CAM_ONLINE_TIMEOUT = 10.0  # seconds without a pushed frame before marking camer
 CLIENT_IDLE_TIMEOUT = 12.0  # seconds without yielding a frame before ending client
 
 # How long to keep the session (and its disease total) alive after the last
-# viewer disconnects. If a viewer returns within this window, the totals continue.
-SESSION_GRACE_SECONDS = float(os.environ.get("SESSION_GRACE_SECONDS", "60"))
+# viewer disconnects. 0 = save and reset immediately, so every new livestream
+# starts from zero. (If you set this in Railway env vars, set it to 0 there too.)
+SESSION_GRACE_SECONDS = float(os.environ.get("SESSION_GRACE_SECONDS", "0"))
 
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get(
@@ -559,22 +560,32 @@ def _cancel_end_timer():
 
 
 def on_client_connected():
+    """Called when the FIRST viewer connects. Always starts a brand-new session
+    with every count back at zero."""
     global session_active, session_saved, session_start_time
-    # A viewer came back during the grace period: keep the same session & totals.
     _cancel_end_timer()
+
+    # Save any leftover, unsaved session from the previous stream first.
     with session_lock:
-        if not session_active:
-            session_active = True
-            session_saved = False
-            session_start_time = time.time()
-            _reset_session_tracks_locked()
-            print("[Session] Started. Tracker cleared.")
-        else:
-            print("[Session] Viewer returned. Continuing existing session.")
+        leftover = session_active and not session_saved
+        if leftover:
+            session_saved = True
+            session_active = False
+    if leftover:
+        print("[Session] Leftover session found. Saving before starting a new one.")
+        save_session_to_supabase(force=False)
+
+    # Always start fresh: clear tracks, IDs back to #1, totals back to 0.
+    with session_lock:
+        _reset_session_tracks_locked()      # sets session_start_time = None
+        session_active = True
+        session_saved = False
+        session_start_time = time.time()    # set AFTER the reset
+    print("[Session] New stream started. Total diseases reset to 0.")
 
 
 def _finalize_session():
-    """Runs after the grace period if nobody reconnected."""
+    """Saves and resets the session once nobody is watching."""
     global session_active, session_saved, _end_timer
     with _end_timer_lock:
         _end_timer = None
@@ -589,7 +600,7 @@ def _finalize_session():
         session_saved = True
         session_active = False
 
-    print("[Session] Grace period over. Saving session with bounding boxes to Supabase...")
+    print("[Session] Saving session with bounding boxes to Supabase...")
     save_session_to_supabase(force=False)
     with session_lock:
         _reset_session_tracks_locked()
@@ -606,6 +617,13 @@ def on_client_disconnected(last_client: bool):
             return
 
     _cancel_end_timer()
+
+    # No grace period: save and reset right away so the next stream starts at 0.
+    if SESSION_GRACE_SECONDS <= 0:
+        print("[Session] Last viewer left. Saving and resetting now.")
+        threading.Thread(target=_finalize_session, daemon=True).start()
+        return
+
     print(
         f"[Session] Last viewer left. Keeping totals for {SESSION_GRACE_SECONDS:.0f}s "
         f"before saving."
@@ -819,15 +837,21 @@ def inference_thread():
                 })
 
             clean = dedupe_detections(clean)
-            tracker_update(clean, time.time(), frame_ts)
 
-            # Cache an annotated frame only occasionally (saves CPU = less lag)
-            if clean and (now - last_annotated_at) >= ANNOTATED_SNAPSHOT_EVERY:
-                annotated = frame.copy()
-                draw_tracks_and_summary(annotated)
-                with frame_lock:
-                    globals()["last_annotated_frame"] = annotated
-                last_annotated_at = time.time()
+            # Only track while a livestream session is active. When nobody is
+            # watching, nothing is counted, so a new stream always starts at 0.
+            with session_lock:
+                active = session_active
+            if active:
+                tracker_update(clean, time.time(), frame_ts)
+
+                # Cache an annotated frame only occasionally (saves CPU = less lag)
+                if clean and (now - last_annotated_at) >= ANNOTATED_SNAPSHOT_EVERY:
+                    annotated = frame.copy()
+                    draw_tracks_and_summary(annotated)
+                    with frame_lock:
+                        globals()["last_annotated_frame"] = annotated
+                    last_annotated_at = time.time()
 
         except Exception as e:
             print(f"[Infer] {type(e).__name__}: {e}")
