@@ -37,9 +37,10 @@ CAM_ONLINE_TIMEOUT = 10.0  # seconds without a pushed frame before marking camer
 CLIENT_IDLE_TIMEOUT = 12.0  # seconds without yielding a frame before ending client
 
 # How long to keep the session (and its disease total) alive after the last
-# viewer disconnects. 0 = save and reset immediately, so every new livestream
-# starts from zero. (If you set this in Railway env vars, set it to 0 there too.)
-SESSION_GRACE_SECONDS = float(os.environ.get("SESSION_GRACE_SECONDS", "0"))
+# viewer disconnects. A viewer who reconnects inside this window (page refresh,
+# network blip) continues the same totals; after it, the session is saved and
+# the next stream starts from zero. 0 = save and reset immediately.
+SESSION_GRACE_SECONDS = float(os.environ.get("SESSION_GRACE_SECONDS", "15"))
 
 # ---------- Supabase ----------
 SUPABASE_URL = os.environ.get(
@@ -638,9 +639,20 @@ def _cancel_end_timer():
 
 
 def on_client_connected():
-    """Called when the FIRST viewer connects. Always starts a brand-new session
-    with every count back at zero."""
+    """Called when the FIRST viewer connects. If the previous viewer left only
+    moments ago (grace period still running), the same session continues with
+    its totals. Otherwise a brand-new session starts with every count at zero."""
     global session_active, session_saved, session_start_time
+
+    with _end_timer_lock:
+        grace_pending = _end_timer is not None
+    with session_lock:
+        resumable = grace_pending and session_active and not session_saved
+    if resumable:
+        _cancel_end_timer()
+        print("[Session] Viewer reconnected within grace period. Continuing totals.")
+        return
+
     _cancel_end_timer()
 
     # Save any leftover, unsaved session from the previous stream first.
