@@ -10,6 +10,7 @@ import requests
 from collections import deque
 from datetime import datetime
 from flask import Flask, Response, render_template_string, jsonify, request
+from werkzeug.exceptions import HTTPException
 from ultralytics import YOLO
 from supabase import create_client, Client
 
@@ -17,8 +18,13 @@ from supabase import create_client, Client
 # Setup
 # ======================================================================
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # reject uploads > 10 MB
 MODEL_PATH = os.environ.get("MODEL_PATH", "best.pt")  # e.g. best.onnx for faster CPU
-model = YOLO(MODEL_PATH)
+try:
+    model = YOLO(MODEL_PATH)
+except Exception as e:
+    print(f"[Model] FATAL: could not load '{MODEL_PATH}': {type(e).__name__}: {e}")
+    raise
 print(f"This model can detect: {model.names}")
 
 ESP32_CAM_URL = os.environ.get("ESP32_CAM_URL", "http://192.168.1.119:81/stream")
@@ -64,8 +70,24 @@ JPEG_QUALITY = 75
 MEMORY_TIME = 15.0
 CHUNK_SIZE = 8192
 IOU_MATCH_THRESHOLD = 0.15
-MIN_FRAMES_TO_CONFIRM = 1
-CONF_THRESHOLD = 0.25
+MIN_FRAMES_TO_CONFIRM = int(os.environ.get("MIN_FRAMES_TO_CONFIRM", "3"))  # must be seen N times
+
+# ---------- Curly-lettuce-only strict filter (all tunable via env vars) ----------
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.40"))  # model-level floor
+CLASS_MIN_CONF = {
+    "healthy": float(os.environ.get("MIN_CONF_HEALTHY", "0.60")),
+    "downy mildew": float(os.environ.get("MIN_CONF_DISEASE", "0.50")),
+    "powdery mildew": float(os.environ.get("MIN_CONF_DISEASE", "0.50")),
+    "bacterial leaf spot": float(os.environ.get("MIN_CONF_DISEASE", "0.50")),
+}
+MIN_FRAME_SIDE = 64                      # reject tiny / corrupt images
+MIN_SCENE_GREEN_RATIO = float(os.environ.get("MIN_SCENE_GREEN_RATIO", "0.05"))  # whole frame must contain some plant green
+MIN_BOX_AREA_RATIO = float(os.environ.get("MIN_BOX_AREA_RATIO", "0.01"))        # box too tiny = noise
+MAX_BOX_AREA_RATIO = float(os.environ.get("MAX_BOX_AREA_RATIO", "0.90"))        # box covering everything = not a plant
+MIN_ASPECT, MAX_ASPECT = 0.4, 2.5        # a lettuce head is roughly round, not a thin strip
+MIN_GREEN_HEALTHY = float(os.environ.get("MIN_GREEN_HEALTHY", "0.40"))          # healthy = mostly green leaf
+MIN_GREEN_DISEASED = float(os.environ.get("MIN_GREEN_DISEASED", "0.15"))        # diseased = lesions allowed, leaf still green
+MIN_EDGE_DENSITY = float(os.environ.get("MIN_EDGE_DENSITY", "0.04"))            # curly/ruffled leaves have many edges
 
 SESSION_FLUSH_INTERVAL = 60  # seconds (optional periodic flush if enabled)
 ENABLE_PERIODIC_FLUSH = os.environ.get("ENABLE_PERIODIC_FLUSH", "0") == "1"
@@ -106,49 +128,105 @@ def get_class_color(class_name: str):
     return COLOR_MAP.get(class_name.strip().lower(), DEFAULT_COLOR)
 
 
-def is_exclusive_lettuce(frame, box, conf) -> bool:
-    """
-    Lettuce-Exclusive Validation Filter (applied ONCE, at detection time):
-    1. Enforces a confidence floor (0.25) to allow valid healthy & infected detections.
-    2. Uses a broader HSV color space mask to verify plant foliage and
-       accommodate dark greens, yellow-greens, bright highlights, and lesions.
-    """
-    if conf < CONF_THRESHOLD:
+GREEN_LO = np.array([25, 35, 25])
+GREEN_HI = np.array([95, 255, 255])
+
+_last_reject_log = 0.0
+
+
+def _log_reject(reason: str):
+    """Rate-limited log so rejected detections don't flood the console."""
+    global _last_reject_log
+    now = time.time()
+    if now - _last_reject_log >= 2.0:
+        _last_reject_log = now
+        print(f"[Filter] Rejected: {reason}")
+
+
+def is_valid_frame(frame) -> bool:
+    """Guards against corrupt / empty / wrongly shaped images."""
+    return (
+        isinstance(frame, np.ndarray)
+        and frame.ndim == 3
+        and frame.shape[2] == 3
+        and frame.shape[0] >= MIN_FRAME_SIDE
+        and frame.shape[1] >= MIN_FRAME_SIDE
+    )
+
+
+def frame_has_plant_scene(frame) -> bool:
+    """Scene gate: if the whole frame has almost no plant-green, there can't be
+    lettuce in it, so skip detection entirely (fail closed)."""
+    try:
+        small = cv2.resize(frame, (160, 120), interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, GREEN_LO, GREEN_HI)
+        ratio = cv2.countNonZero(mask) / float(mask.size)
+        if ratio < MIN_SCENE_GREEN_RATIO:
+            _log_reject(f"scene has no plant foliage (green {ratio:.3f})")
+            return False
+        return True
+    except Exception:
         return False
 
+
+def validate_lettuce_detection(frame, box, conf, class_name):
+    """
+    Strict curly-lettuce validation, applied once per detection. Returns
+    (ok, reason). Every check must pass, and any error rejects the detection.
+      1. per-class confidence floor (healthy needs more certainty)
+      2. box size and shape sanity
+      3. green foliage ratio (stricter for healthy than for diseased)
+      4. edge density, which separates ruffled/curly leaves from smooth objects
+    """
     try:
+        min_conf = CLASS_MIN_CONF.get(class_name, 1.0)
+        if conf < min_conf:
+            return False, f"{class_name} conf {conf:.2f} < {min_conf:.2f}"
+
         x1, y1, x2, y2 = box
-        h, w, _ = frame.shape
-        x1 = max(0, min(x1, w - 1))
-        x2 = max(0, min(x2, w))
-        y1 = max(0, min(y1, h - 1))
-        y2 = max(0, min(y2, h))
+        h, w = frame.shape[:2]
+        x1 = max(0, min(int(x1), w - 1))
+        x2 = max(0, min(int(x2), w))
+        y1 = max(0, min(int(y1), h - 1))
+        y2 = max(0, min(int(y2), h))
+        bw, bh = x2 - x1, y2 - y1
+        if bw <= 8 or bh <= 8:
+            return False, "box too small"
 
-        box_width = x2 - x1
-        box_height = y2 - y1
+        area_ratio = (bw * bh) / float(w * h)
+        if area_ratio < MIN_BOX_AREA_RATIO:
+            return False, f"box area {area_ratio:.3f} too small"
+        if area_ratio > MAX_BOX_AREA_RATIO:
+            return False, f"box area {area_ratio:.3f} too large"
 
-        if box_width <= 8 or box_height <= 8:
-            return False
+        aspect = bw / float(bh)
+        if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
+            return False, f"aspect {aspect:.2f} not plant-like"
 
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
-            return False
+            return False, "empty crop"
 
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        lower_foliage = np.array([5, 10, 10])
-        upper_foliage = np.array([105, 255, 255])
+        green = cv2.countNonZero(cv2.inRange(hsv, GREEN_LO, GREEN_HI)) / float(bw * bh)
+        min_green = MIN_GREEN_HEALTHY if class_name == "healthy" else MIN_GREEN_DISEASED
+        if green < min_green:
+            return False, f"{class_name} green {green:.2f} < {min_green:.2f}"
 
-        mask = cv2.inRange(hsv, lower_foliage, upper_foliage)
-        foliage_pixel_count = cv2.countNonZero(mask)
-        total_pixels = box_width * box_height
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        scale = 160.0 / max(bw, bh)
+        if scale < 1.0:
+            gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        edges = cv2.Canny(gray, 50, 130)
+        edge_density = cv2.countNonZero(edges) / float(edges.size)
+        if edge_density < MIN_EDGE_DENSITY:
+            return False, f"not curly: edge density {edge_density:.3f} < {MIN_EDGE_DENSITY:.3f}"
 
-        foliage_ratio = foliage_pixel_count / float(total_pixels)
-        if foliage_ratio < 0.01:
-            return False
-
-        return True
-    except Exception:
-        return True
+        return True, "ok"
+    except Exception as e:
+        return False, f"validation error {type(e).__name__}: {e}"
 
 
 def health_label_for(diseased: int) -> str:
@@ -767,10 +845,60 @@ def extract_box(det):
     return None
 
 
+def detect_lettuce(frame):
+    """Runs the model and returns ONLY detections that pass the strict curly-lettuce
+    filter. Used by both the live stream and /upload so they behave identically.
+    Never raises on bad input: returns [] instead."""
+    if not is_valid_frame(frame):
+        return []
+    if not frame_has_plant_scene(frame):
+        return []
+
+    with model_lock:
+        results = model.predict(
+            source=frame,
+            conf=CONF_THRESHOLD,
+            imgsz=INFER_IMGSZ,
+            verbose=False,
+            agnostic_nms=True,  # one box per plant even if classes disagree
+            max_det=30,
+        )
+    r0 = results[0]
+
+    if r0.boxes is not None and len(r0.boxes) > 0:
+        dets = list(r0.boxes)
+    elif hasattr(r0, "obb") and r0.obb is not None and len(r0.obb) > 0:
+        dets = list(r0.obb)
+    else:
+        dets = []
+
+    clean = []
+    for det in dets:
+        cls_id = int(det.cls[0])
+        cls_name = model.names.get(cls_id, "").strip().lower()
+        if cls_name not in VALID_CLASSES:
+            continue
+
+        box = extract_box(det)
+        if box is None:
+            continue
+
+        conf = float(det.conf[0]) if det.conf is not None else 0.0
+        ok, reason = validate_lettuce_detection(frame, box, conf, cls_name)
+        if not ok:
+            _log_reject(reason)
+            continue
+
+        clean.append({"cls_id": cls_id, "name": cls_name, "conf": conf, "box": box})
+
+    return dedupe_detections(clean)
+
+
 def inference_thread():
     last_infer = 0.0
     last_seen_frame = -1
     last_annotated_at = 0.0
+    consecutive_errors = 0
     while True:
         now = time.time()
         if now - last_infer < INFER_INTERVAL:
@@ -794,49 +922,8 @@ def inference_thread():
         last_infer = now
 
         try:
-            with model_lock:
-                results = model.predict(
-                    source=frame,
-                    conf=CONF_THRESHOLD,
-                    imgsz=INFER_IMGSZ,
-                    verbose=False,
-                    agnostic_nms=True,  # one box per plant even if classes disagree
-                    max_det=30,
-                )
-            r0 = results[0]
-
-            if r0.boxes is not None and len(r0.boxes) > 0:
-                dets = list(r0.boxes)
-            elif hasattr(r0, "obb") and r0.obb is not None and len(r0.obb) > 0:
-                dets = list(r0.obb)
-            else:
-                dets = []
-
-            clean = []
-            for det in dets:
-                cls_id = int(det.cls[0])
-                cls_name = model.names.get(cls_id, "").strip().lower()
-
-                if cls_name not in VALID_CLASSES:
-                    continue
-
-                box = extract_box(det)
-                if box is None:
-                    continue
-
-                conf = float(det.conf[0]) if det.conf is not None else 0.0
-
-                # Lettuce validation happens here, once, at detection time.
-                if not is_exclusive_lettuce(frame, box, conf):
-                    continue
-
-                clean.append({
-                    "cls_id": cls_id,
-                    "conf": conf,
-                    "box": box,
-                })
-
-            clean = dedupe_detections(clean)
+            clean = detect_lettuce(frame)
+            consecutive_errors = 0
 
             # Only track while a livestream session is active. When nobody is
             # watching, nothing is counted, so a new stream always starts at 0.
@@ -854,7 +941,9 @@ def inference_thread():
                     last_annotated_at = time.time()
 
         except Exception as e:
-            print(f"[Infer] {type(e).__name__}: {e}")
+            consecutive_errors += 1
+            print(f"[Infer] {type(e).__name__}: {e} (error #{consecutive_errors})")
+            time.sleep(min(0.2 * consecutive_errors, 3.0))  # back off instead of spinning
 
 
 # ======================================================================
@@ -1024,39 +1113,12 @@ def generate_frames():
 # Scheduled-scan analysis (For Notifications / Periodic Scans)
 # ======================================================================
 def analyze_image(frame):
-    with model_lock:
-        results = model.predict(
-            source=frame, conf=CONF_THRESHOLD, imgsz=INFER_IMGSZ, verbose=False
-        )
-    r0 = results[0]
-
-    if r0.boxes is not None and len(r0.boxes) > 0:
-        dets = list(r0.boxes)
-    elif hasattr(r0, "obb") and r0.obb is not None and len(r0.obb) > 0:
-        dets = list(r0.obb)
-    else:
-        dets = []
-
+    dets = detect_lettuce(frame)
     counts, confs = {}, []
-    for det in dets:
-        cls_id = int(det.cls[0])
-        name = model.names.get(cls_id, "").strip().lower()
-        conf = float(det.conf[0]) if det.conf is not None else 0.0
-        print(f"[Analyze] Raw det: class={name} ({cls_id}) conf={conf:.3f}")
-
-        if name not in VALID_CLASSES:
-            continue
-
-        box = extract_box(det)
-        if box is None:
-            continue
-
-        if not is_exclusive_lettuce(frame, box, conf):
-            print(f"[Analyze] Filtered out by is_exclusive_lettuce: {name} conf={conf:.3f}")
-            continue
-
-        counts[name] = counts.get(name, 0) + 1
-        confs.append(conf)
+    for d in dets:
+        print(f"[Analyze] Accepted: class={d['name']} conf={d['conf']:.3f}")
+        counts[d["name"]] = counts.get(d["name"], 0) + 1
+        confs.append(d["conf"])
 
     avg_conf = sum(confs) / len(confs) if confs else 0.0
     return counts, avg_conf
@@ -1161,6 +1223,22 @@ HTML_PAGE = """
 """
 
 
+@app.errorhandler(HTTPException)
+def handle_http_exception(e):
+    """404, 405, 413 (file too large), etc. are returned as clean JSON."""
+    return jsonify({"error": e.name, "message": e.description}), e.code
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_exception(e):
+    """Any unhandled error: log it, return JSON, never crash the server."""
+    print(f"[Error] Unhandled {type(e).__name__}: {e}")
+    return jsonify({
+        "error": "Internal server error",
+        "message": "Something went wrong while processing the request.",
+    }), 500
+
+
 @app.route("/")
 def index():
     return render_template_string(HTML_PAGE)
@@ -1181,8 +1259,8 @@ def push_frame():
         return jsonify({"error": "empty body"}), 400
 
     frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    if frame is None:
-        return jsonify({"error": "bad image"}), 400
+    if not is_valid_frame(frame):
+        return jsonify({"error": "bad or too small image"}), 400
 
     with frame_lock:
         latest_frame = frame
@@ -1225,8 +1303,8 @@ def upload():
         return jsonify({"error": "empty body"}), 400
 
     frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    if frame is None:
-        return jsonify({"error": "bad image"}), 400
+    if not is_valid_frame(frame):
+        return jsonify({"error": "Invalid image: file is corrupt, empty, or too small."}), 400
 
     try:
         counts, avg_conf = analyze_image(frame)
@@ -1234,10 +1312,10 @@ def upload():
         total_lettuce = sum(counts.values())
         if total_lettuce == 0:
             print(
-                "[Upload Error] Rejected: Non-lettuce or invalid image content detected."
+                "[Upload Error] Rejected: no curly lettuce detected."
             )
             return jsonify({
-                "error": "Invalid image: No valid lettuce detected. This system is strictly exclusive for lettuce crops and lettuce diseases only."
+                "error": "Invalid image: no curly lettuce detected. This system only analyzes curly lettuce (healthy, downy mildew, powdery mildew, bacterial leaf spot)."
             }), 400
 
         row = save_scan_to_supabase(counts, avg_conf)
@@ -1312,6 +1390,18 @@ def history():
         return jsonify({"source": source, "records": res.data or []})
     except Exception as e:
         return jsonify({"error": str(e)})
+
+
+@app.route("/health")
+def health():
+    with session_lock:
+        active = session_active
+    return jsonify({
+        "status": "ok",
+        "model_loaded": model is not None,
+        "camera_online": is_camera_online(),
+        "session_active": active,
+    })
 
 
 @app.route("/session/force_save", methods=["POST"])
